@@ -1,0 +1,1 @@
+﻿UPDATE plan_catalog SET features_json=(SELECT json_group_array(value) FROM json_each(plan_catalog.features_json) WHERE value <> 'whatsappReports') WHERE json_valid(features_json) AND EXISTS (SELECT 1 FROM json_each(plan_catalog.features_json) WHERE value = 'whatsappReports');

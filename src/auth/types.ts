@@ -1,0 +1,3 @@
+export type UserRole = 'admin' | 'farmer';
+export interface User { id: string; farmer_id: string | null; email: string; display_name: string; mobile_number: string; role: UserRole; active: boolean; created_at: string }
+export interface AuthContextValue { user: User | null; loading: boolean; farmerDraft: Record<string, string> | null; setFarmerDraft: (draft: Record<string, string> | null) => void; login: (email: string, password: string) => Promise<User>; register: (email: string, password: string, displayName: string, mobileNumber: string) => Promise<User>; logout: () => Promise<void>; refresh: () => Promise<void> }

@@ -1,0 +1,8 @@
+ALTER TABLE plan_catalog ADD COLUMN active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1));
+ALTER TABLE plan_catalog ADD COLUMN is_recommended INTEGER NOT NULL DEFAULT 0 CHECK (is_recommended IN (0,1));
+UPDATE plan_catalog SET is_recommended=1 WHERE plan_key='plus' AND features_json='[]';
+UPDATE plan_catalog SET features_json='["cropRecommendations","weatherOutlook","governmentSchemes","onlineResults","chatbotFeature"]' WHERE plan_key='free' AND features_json='[]';
+UPDATE plan_catalog SET features_json='["cropRecommendations","weatherOutlook","governmentSchemes","onlineResults","fertilizerRecommendations","pdfDownload","emailReports","eligibilityGuidance","savedHistory","chatbotFeature"]' WHERE plan_key='basic' AND features_json='[]';
+UPDATE plan_catalog SET features_json='["cropRecommendations","weatherOutlook","governmentSchemes","onlineResults","fertilizerRecommendations","pdfDownload","emailReports","eligibilityGuidance","savedHistory","whatsappReports","marketPriceInsights","disasterAssistance","chatbotFeature"]' WHERE plan_key='plus' AND features_json='[]';
+UPDATE plan_catalog SET features_json='["cropRecommendations","weatherOutlook","governmentSchemes","onlineResults","fertilizerRecommendations","pdfDownload","emailReports","eligibilityGuidance","savedHistory","whatsappReports","marketPriceInsights","disasterAssistance","higherQuota","chatbotFeature"]' WHERE plan_key='premium' AND features_json='[]';
+UPDATE plan_catalog SET features_json='["cropRecommendations","weatherContext","onlineResultsReports"]' WHERE plan_key IN ('organizationStarter','organizationGrowth') AND features_json='[]';

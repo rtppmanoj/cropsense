@@ -1,0 +1,23 @@
+version: 1
+description: >-
+  Each source must explicitly map the six supported user/model features and a crop label,
+  with units matching the canonical units below. Rainfall is not requested by the current form.
+sources:
+  - path: datasets/raw/kaggle/Crop_recommendation.csv
+    enabled: true
+    target: crop
+    target_column: label
+    columns:
+      nitrogen: N
+      phosphorus: P
+      potassium: K
+      temperature: temperature
+      humidity: humidity
+      ph: ph
+    units:
+      nitrogen: kaggle_source_scale
+      phosphorus: kaggle_source_scale
+      potassium: kaggle_source_scale
+      temperature: C
+      humidity: "%"
+      ph: pH

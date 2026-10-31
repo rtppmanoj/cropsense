@@ -1,0 +1,244 @@
+{
+  "model": "random_forest",
+  "evaluation": {
+    "holdout_rows": 440,
+    "holdout_accuracy": 0.9681818181818181,
+    "holdout_balanced_accuracy": 0.9681818181818183,
+    "holdout_macro_precision": 0.9690448122942402,
+    "holdout_macro_recall": 0.9681818181818183,
+    "holdout_macro_f1": 0.968117521988018,
+    "holdout_log_loss": 0.11934749601653216,
+    "holdout_top5_accuracy": 1.0,
+    "classification_report": {
+      "apple": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "banana": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "blackgram": {
+        "precision": 0.9523809523809523,
+        "recall": 1.0,
+        "f1-score": 0.975609756097561,
+        "support": 20.0
+      },
+      "chickpea": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "coconut": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "coffee": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "cotton": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "grapes": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "jute": {
+        "precision": 0.8095238095238095,
+        "recall": 0.85,
+        "f1-score": 0.8292682926829268,
+        "support": 20.0
+      },
+      "kidneybeans": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "lentil": {
+        "precision": 0.9444444444444444,
+        "recall": 0.85,
+        "f1-score": 0.8947368421052632,
+        "support": 20.0
+      },
+      "maize": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "mango": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "mothbeans": {
+        "precision": 0.9444444444444444,
+        "recall": 0.85,
+        "f1-score": 0.8947368421052632,
+        "support": 20.0
+      },
+      "mungbean": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "muskmelon": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "orange": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "papaya": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "pigeonpeas": {
+        "precision": 0.8260869565217391,
+        "recall": 0.95,
+        "f1-score": 0.8837209302325582,
+        "support": 20.0
+      },
+      "pomegranate": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "rice": {
+        "precision": 0.8421052631578947,
+        "recall": 0.8,
+        "f1-score": 0.8205128205128205,
+        "support": 20.0
+      },
+      "watermelon": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 20.0
+      },
+      "accuracy": 0.9681818181818181,
+      "macro avg": {
+        "precision": 0.9690448122942402,
+        "recall": 0.9681818181818183,
+        "f1-score": 0.968117521988018,
+        "support": 440.0
+      },
+      "weighted avg": {
+        "precision": 0.9690448122942402,
+        "recall": 0.9681818181818181,
+        "f1-score": 0.9681175219880179,
+        "support": 440.0
+      }
+    },
+    "test_fraction": 0.2,
+    "random_seed": 42,
+    "cv_folds_on_training_only": 5,
+    "candidate_cv_scores": {
+      "random_forest": {
+        "macro_f1_mean": 0.9629517238259202,
+        "macro_f1_std": 0.006535011575118829,
+        "balanced_accuracy_mean": 0.9630681818181819
+      },
+      "extra_trees": {
+        "macro_f1_mean": 0.95956367773678,
+        "macro_f1_std": 0.004111042126323147,
+        "balanced_accuracy_mean": 0.9596590909090909
+      },
+      "hist_gradient_boosting": {
+        "macro_f1_mean": 0.9567117022695643,
+        "macro_f1_std": 0.009889068648498001,
+        "balanced_accuracy_mean": 0.9568181818181818
+      }
+    },
+    "selected_by": "mean cross-validated macro F1 on training split",
+    "selection": "random_forest",
+    "sklearn_version": "1.9.1"
+  },
+  "dataset_audit": {
+    "sources": [
+      {
+        "file": "datasets/raw/kaggle/Crop_recommendation.csv",
+        "source_rows": 2200,
+        "rows_missing_target_removed": 0,
+        "rows_missing_features": 0,
+        "columns": [
+          "N",
+          "P",
+          "K",
+          "temperature",
+          "humidity",
+          "ph",
+          "rainfall",
+          "label"
+        ],
+        "mapped_features": {
+          "nitrogen": "N",
+          "phosphorus": "P",
+          "potassium": "K",
+          "temperature": "temperature",
+          "humidity": "humidity",
+          "ph": "ph"
+        },
+        "units": {
+          "nitrogen": "kaggle_source_scale",
+          "phosphorus": "kaggle_source_scale",
+          "potassium": "kaggle_source_scale",
+          "temperature": "C",
+          "humidity": "%",
+          "ph": "pH"
+        },
+        "label_policy": "identity"
+      }
+    ],
+    "combined_rows_before_deduplication": 2200,
+    "exact_duplicate_rows_removed": 0,
+    "training_rows": 2200,
+    "crop_classes": 22,
+    "features": [
+      "nitrogen",
+      "phosphorus",
+      "potassium",
+      "temperature",
+      "humidity",
+      "ph"
+    ],
+    "units": {
+      "nitrogen": "kaggle_source_scale",
+      "phosphorus": "kaggle_source_scale",
+      "potassium": "kaggle_source_scale",
+      "temperature": "C",
+      "humidity": "%",
+      "ph": "pH"
+    },
+    "ignored_source_columns": [
+      "rainfall: not supplied as an input measurement"
+    ]
+  },
+  "artifact": "models\\crop_model.joblib"
+}
