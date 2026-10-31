@@ -22,6 +22,7 @@ load_dotenv(ROOT / ".env")
 from backend.dataset_pipeline import FEATURES
 from backend.schemas import CropInput, CropMatch, RecommendationResponse
 from backend.auth import router as auth_router, store as auth_store
+from backend.auth_admin import ensure_admin_from_environment
 from backend.email_report import router as email_report_router
 from backend.chatbot import router as chatbot_router
 from backend.plans import router as plans_router
@@ -34,6 +35,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app):
     with auth_store.connection() as db:
         db.execute("DELETE FROM sessions WHERE julianday(expires_at) < julianday('now')")
+    try:
+        if ensure_admin_from_environment():
+            logger.info("Initial admin account provisioned from deployment environment.")
+    except RuntimeError as exc:
+        logger.error("Initial admin provisioning failed: %s", exc)
+        raise
     try:
         load_artifacts()
     except HTTPException as exc:
