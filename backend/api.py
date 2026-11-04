@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
@@ -23,6 +24,7 @@ from backend.dataset_pipeline import FEATURES
 from backend.schemas import CropInput, CropMatch, RecommendationResponse
 from backend.auth import router as auth_router, store as auth_store
 from backend.auth_admin import ensure_admin_from_environment
+from backend.auth_store import DB_ERRORS
 from backend.email_report import router as email_report_router
 from backend.chatbot import router as chatbot_router
 from backend.plans import router as plans_router
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app):
     with auth_store.connection() as db:
-        db.execute("DELETE FROM sessions WHERE julianday(expires_at) < julianday('now')")
+        db.execute("DELETE FROM sessions WHERE expires_at < ?", (datetime.now(timezone.utc).isoformat(),))
     try:
         if ensure_admin_from_environment():
             logger.info("Initial admin account provisioned from deployment environment.")
@@ -114,9 +116,15 @@ def load_artifacts():
 def health():
     try:
         _, info = load_artifacts()
-        return {"status": "ready", "model": info["model_name"], "version": info["model_version"]}
+        with auth_store.connection() as db:
+            db.execute("SELECT 1").fetchone()
+        return {"status": "ready", "model": info["model_name"], "version": info["model_version"],
+                "database": "postgresql" if auth_store.uses_postgres else "sqlite"}
     except HTTPException:
         return JSONResponse(status_code=503, content={"status": "model_unavailable"})
+    except DB_ERRORS + (RuntimeError,):
+        logger.exception("Database health check failed")
+        return JSONResponse(status_code=503, content={"status": "database_unavailable"})
 
 
 @app.get("/api/metadata")

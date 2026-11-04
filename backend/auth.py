@@ -27,7 +27,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError, Verificatio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from backend.auth_store import AuthStore, token_digest
+from backend.auth_store import AuthStore, DB_INTEGRITY_ERRORS, token_digest
 from backend.schemas import CropInput, Credentials, FarmerRecommendationRequest, FarmerRegistration, FarmerStatusUpdate, PasswordChange, ProfileUpdate, SchemeStatusUpdate
 
 router = APIRouter(prefix="/api")
@@ -268,7 +268,7 @@ def farmer_register(payload: FarmerRegistration, request: Request, response: Res
             db.execute("INSERT INTO users(id,farmer_id,email,display_name,mobile_number,password_hash,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,'farmer',1,?,?)",
                        (user_id, farmer_id, payload.email, payload.display_name, payload.mobile_number, digest, created, created))
             _audit(db, "farmer_registered", user_id, user_id)
-    except sqlite3.IntegrityError as exc:
+    except DB_INTEGRITY_ERRORS as exc:
         raise HTTPException(409, "An account with that email already exists.") from exc
     _start_session(response, user_id)
     return {"user": {"id": user_id, "farmer_id": farmer_id, "email": payload.email, "display_name": payload.display_name, "mobile_number": payload.mobile_number,
@@ -525,9 +525,12 @@ def farmer_recommend(payload: FarmerRecommendationRequest, request: Request, use
         }))
     result = result.model_copy(update={"recommendations": recommendations})
     with store.connection() as db:
-        # Reserve the next per-farmer report number under SQLite's write lock.
-        # This keeps simultaneous requests from reading and inserting the same ID.
-        db.execute("BEGIN IMMEDIATE")
+        # Serialize report numbering per farmer on both SQLite and PostgreSQL.
+        if store.uses_postgres:
+            db.execute("BEGIN")
+            db.execute("SELECT id FROM users WHERE id=? FOR UPDATE", (user["id"],))
+        else:
+            db.execute("BEGIN IMMEDIATE")
         counter = db.execute("SELECT last_report_number FROM farmer_report_counters WHERE user_id=?", (user["id"],)).fetchone()
         max_history_number = db.execute(
             "SELECT COALESCE(MAX(report_number), 0) FROM recommendation_history WHERE user_id=?", (user["id"],)

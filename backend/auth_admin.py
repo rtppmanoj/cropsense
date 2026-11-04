@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import uuid
 
 from argon2 import PasswordHasher
 
 from backend.auth import now_iso, _audit
-from backend.auth_store import AuthStore
+from backend.auth_store import AuthStore, DB_INTEGRITY_ERRORS
 
 
 def ensure_admin_from_environment() -> bool:
@@ -33,7 +32,7 @@ def ensure_admin_from_environment() -> bool:
             db.execute("INSERT INTO users(id,email,display_name,password_hash,role,active,created_at,updated_at) VALUES(?,?,? ,?,'admin',1,?,?)",
                        (user_id, email, "CropSense administrator", PasswordHasher().hash(password), created, created))
             _audit(db, "admin_provisioned", user_id, user_id)
-    except sqlite3.IntegrityError as exc:
+    except DB_INTEGRITY_ERRORS as exc:
         raise RuntimeError("The configured admin email already belongs to another account.") from exc
     return True
 
@@ -55,7 +54,7 @@ def provision_admin() -> None:
             db.execute("INSERT INTO users(id,email,display_name,password_hash,role,active,created_at,updated_at) VALUES(?,?,? ,?,'admin',1,?,?)",
                        (user_id, email, "CropSense administrator", PasswordHasher().hash(password), created, created))
             _audit(db, "admin_provisioned", user_id, user_id)
-    except sqlite3.IntegrityError as exc:
+    except DB_INTEGRITY_ERRORS as exc:
         raise SystemExit("That email already belongs to an account; no admin was created.") from exc
     print(f"Initial admin provisioned for {email}. The password was not printed or stored in plaintext.")
 

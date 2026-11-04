@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from typing import Literal
 
@@ -14,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.auth import _check_origin, _rate_limit
+from backend.auth_store import DB_ERRORS
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -119,7 +119,6 @@ PAGE_CONTEXTS = {
 def _authenticated_farmer_context(request: Request, needs_results: bool, needs_schemes: bool) -> dict:
     """Load only the signed-in farmer's minimal context; public visitors get none."""
     from backend.auth import current_user, store
-
     try:
         user = current_user(request)
     except HTTPException:
@@ -186,7 +185,7 @@ def _build_context(payload: ChatRequest, request: Request) -> str:
                      "features": item["features"], "recommended": bool(item.get("is_recommended"))} for item in read_public_catalog()]
         parts.append("Current plan catalogue (authoritative prices and allowances, yearly recommendation limits): " +
                      json.dumps(catalogue, ensure_ascii=False, separators=(",", ":")))
-    except (KeyError, OSError, sqlite3.Error):
+    except (KeyError, OSError, *DB_ERRORS):
         logger.exception("Could not load current plan catalogue for CropSaathi")
     page_state = payload.page_state.model_dump(exclude_none=True)
     from backend.chatbot_faq import relevant_faq
@@ -238,7 +237,9 @@ async def cropsaathi_chat(payload: ChatRequest, request: Request):
         }
         return {"reply": prompts[payload.language]}
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free").strip()
+    # Prefer a multilingual, efficient free MoE model and use distinct
+    # providers as model-level fallbacks when an endpoint is temporarily busy.
+    model = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-30b-a3b:free").strip()
     if not api_key or not model:
         logger.error("CropSaathi OpenRouter configuration missing key_configured=%s model_configured=%s", bool(api_key), bool(model))
         raise HTTPException(status_code=503, detail="CropSaathi AI is not configured yet. Set OPENROUTER_API_KEY and OPENROUTER_MODEL in the backend environment.")
@@ -257,7 +258,7 @@ async def cropsaathi_chat(payload: ChatRequest, request: Request):
     language_instruction = f"Reply in {language_names[payload.language]} because it is the farmer's selected website language. Keep CropSense, CropSaathi, Smart Farm Labs, official scheme names, URLs, and technical units accurate."
     fallback_config = os.getenv(
         "OPENROUTER_FALLBACK_MODELS",
-        "nvidia/nemotron-3.5-super-vl:free,nvidia/nemotron-3.5-lightning:free,google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,openrouter/free",
+        "xingchen-agi/xing4.0-29b-a4b:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     )
     fallback_models = list(dict.fromkeys(
         item.strip() for item in fallback_config.split(",") if item.strip() and item.strip() != model
@@ -266,7 +267,7 @@ async def cropsaathi_chat(payload: ChatRequest, request: Request):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": language_instruction},
         {"role": "system", "content": page_context}, *turns,
-    ], "temperature": 0.35, "max_tokens": 700, "stream": False,
+    ], "temperature": 0.35, "max_tokens": 500, "stream": False,
         "provider": {"allow_fallbacks": True}}
     started_at = time.monotonic()
     try:
