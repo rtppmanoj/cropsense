@@ -162,7 +162,8 @@ def _send_template(token: str, phone_number_id: str, version: str, recipient: st
         if "report_id" in body_fields and not report_id:
             raise HTTPException(status_code=422, detail="The WhatsApp template expects a report ID, but this report has none.")
         components.append({"type": "body", "parameters": [
-            {"type": "text", "text": values[field]} for field in body_fields
+            {"type": "text", "parameter_name": field, "text": values[field]}
+            for field in body_fields
         ]})
     payload = {
         "messaging_product": "whatsapp",
