@@ -23,14 +23,15 @@ def ensure_admin_from_environment() -> bool:
     user_id = str(uuid.uuid4())
     try:
         with store.connection() as db:
-            if db.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone():
+            if db.users.find_one({"role": "admin"}, {"_id": 1}):
                 return False
             if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
                 raise RuntimeError("CROPSENSE_ADMIN_EMAIL must be a valid address to create the initial admin.")
             if len(password) < 8 or len(password) > 128:
                 raise RuntimeError("CROPSENSE_ADMIN_PASSWORD must be 8-128 characters to create the initial admin.")
-            db.execute("INSERT INTO users(id,email,display_name,password_hash,role,active,created_at,updated_at) VALUES(?,?,? ,?,'admin',1,?,?)",
-                       (user_id, email, "CropSense administrator", PasswordHasher().hash(password), created, created))
+            db.users.insert_one({"id": user_id, "email": email, "display_name": "CropSense administrator",
+                "password_hash": PasswordHasher().hash(password), "role": "admin", "active": True,
+                "created_at": created, "updated_at": created, "mobile_number": None, "farmer_id": None})
             _audit(db, "admin_provisioned", user_id, user_id)
     except DB_INTEGRITY_ERRORS as exc:
         raise RuntimeError("The configured admin email already belongs to another account.") from exc
@@ -49,10 +50,11 @@ def provision_admin() -> None:
     user_id = str(uuid.uuid4())
     try:
         with store.connection() as db:
-            if db.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone():
+            if db.users.find_one({"role": "admin"}, {"_id": 1}):
                 raise SystemExit("An admin account already exists. Provisioning will not replace or reset it.")
-            db.execute("INSERT INTO users(id,email,display_name,password_hash,role,active,created_at,updated_at) VALUES(?,?,? ,?,'admin',1,?,?)",
-                       (user_id, email, "CropSense administrator", PasswordHasher().hash(password), created, created))
+            db.users.insert_one({"id": user_id, "email": email, "display_name": "CropSense administrator",
+                "password_hash": PasswordHasher().hash(password), "role": "admin", "active": True,
+                "created_at": created, "updated_at": created, "mobile_number": None, "farmer_id": None})
             _audit(db, "admin_provisioned", user_id, user_id)
     except DB_INTEGRITY_ERRORS as exc:
         raise SystemExit("That email already belongs to an account; no admin was created.") from exc

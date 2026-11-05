@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app):
     with auth_store.connection() as db:
-        db.execute("DELETE FROM sessions WHERE expires_at < ?", (datetime.now(timezone.utc).isoformat(),))
+        now = datetime.now(timezone.utc).isoformat()
+        db.sessions.delete_many({"expires_at": {"$lt": now}})
+        db.farmer_password_resets.delete_many({"expires_at": {"$lt": now}})
     try:
         if ensure_admin_from_environment():
             logger.info("Initial admin account provisioned from deployment environment.")
@@ -116,10 +118,9 @@ def load_artifacts():
 def health():
     try:
         _, info = load_artifacts()
-        with auth_store.connection() as db:
-            db.execute("SELECT 1").fetchone()
+        auth_store.check()
         return {"status": "ready", "model": info["model_name"], "version": info["model_version"],
-                "database": "postgresql" if auth_store.uses_postgres else "sqlite"}
+                "database": "mongodb"}
     except HTTPException:
         return JSONResponse(status_code=503, content={"status": "model_unavailable"})
     except DB_ERRORS + (RuntimeError,):

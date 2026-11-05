@@ -1,8 +1,6 @@
 """Public plan catalogue and admin-managed annual pricing/allowances."""
 from __future__ import annotations
 
-import json
-import sqlite3
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -35,20 +33,18 @@ class PlanCatalogUpdate(BaseModel):
     plans: list[PlanDetails] = Field(min_length=1, max_length=6)
 
 
-def _read_catalog(db: sqlite3.Connection, *, active_only: bool = False) -> list[dict]:
+def _read_catalog(db, *, active_only: bool = False) -> list[dict]:
+    query = {"active": True} if active_only else {}
+    order = {key: index for index, key in enumerate(
+        ("free", "basic", "plus", "premium", "organizationStarter", "organizationGrowth"))}
+    rows = db.plan_catalog.find(query, {"_id": 0}).sort("key", 1)
     results = []
-    for row in db.execute(
-        "SELECT plan_key AS key,price_inr,annual_limit,display_name,description,features_json,updated_at,active,is_recommended FROM plan_catalog "
-        + ("WHERE active=1 " if active_only else "") + "ORDER BY CASE plan_key WHEN 'free' THEN 1 WHEN 'basic' THEN 2 WHEN 'plus' THEN 3 "
-        "WHEN 'premium' THEN 4 WHEN 'organizationStarter' THEN 5 ELSE 6 END"
-    ).fetchall():
-        item = dict(row)
-        try:
-            item["features"] = json.loads(item.pop("features_json"))
-        except (TypeError, json.JSONDecodeError):
-            item["features"] = []
+    for row in rows:
+        item = {key: row.get(key) for key in (
+            "key", "price_inr", "annual_limit", "display_name", "description", "updated_at", "active", "is_recommended")}
+        item["features"] = row.get("features", [])
         results.append(item)
-    return results
+    return sorted(results, key=lambda item: order.get(item["key"], 99))
 
 
 def read_public_catalog() -> list[dict]:
@@ -68,10 +64,10 @@ def record_plan_selection(plan_key: PlanKey, request: Request):
     _check_origin(request)
     _rate_limit(request, "plan-selection", 20, 3600)
     with auth_store.connection() as db:
-        active = db.execute("SELECT active FROM plan_catalog WHERE plan_key=?", (plan_key,)).fetchone()
+        active = db.plan_catalog.find_one({"key": plan_key}, {"active": 1})
         if not active or not active["active"]:
             raise HTTPException(404, "This plan is not currently available.")
-        db.execute("INSERT INTO plan_selections(plan_key,selected_at) VALUES(?,?)", (plan_key, now_iso()))
+        db.plan_selections.insert_one({"plan_key": plan_key, "selected_at": now_iso()})
     return {"recorded": True}
 
 
@@ -113,17 +109,17 @@ def admin_update_plans(payload: PlanCatalogUpdate, request: Request, user: Admin
     changes = [plan.model_dump(exclude_none=True, exclude={"updated_at"}) for plan in payload.plans]
     with auth_store.connection() as db:
         if recommended:
-            db.execute("UPDATE plan_catalog SET is_recommended=0")
-        db.executemany(
-            "UPDATE plan_catalog SET display_name=COALESCE(?,display_name),description=COALESCE(?,description),"
-            "features_json=COALESCE(?,features_json),price_inr=COALESCE(?,price_inr),"
-            "annual_limit=COALESCE(?,annual_limit),active=COALESCE(?,active),"
-            "is_recommended=COALESCE(?,is_recommended),updated_at=? WHERE plan_key=?",
-            [(plan.display_name.strip() if plan.display_name is not None else None,
-              plan.description.strip() if plan.description is not None else None,
-              json.dumps([feature.strip() for feature in plan.features]) if plan.features is not None else None,
-              plan.price_inr, plan.annual_limit, plan.active, plan.is_recommended, timestamp, plan.key) for plan in payload.plans],
-        )
+            db.plan_catalog.update_many({}, {"$set": {"is_recommended": False}})
+        for plan in payload.plans:
+            update = plan.model_dump(exclude_none=True, exclude={"updated_at", "key"})
+            if "features" in update:
+                update["features"] = [feature.strip() for feature in update["features"]]
+            if "display_name" in update:
+                update["display_name"] = update["display_name"].strip()
+            if "description" in update:
+                update["description"] = update["description"].strip()
+            update["updated_at"] = timestamp
+            db.plan_catalog.update_one({"key": plan.key}, {"$set": update})
         _audit(db, "admin_plan_catalog_updated", user["id"], None, {"plans": changes})
         plans = _read_catalog(db)
     return {"plans": plans}
@@ -136,7 +132,7 @@ def admin_delete_plan(plan_key: PlanKey, request: Request, user: AdminUser):
     if plan_key == "free":
         raise HTTPException(422, "The Free plan is required for new farmer accounts and cannot be deleted.")
     with auth_store.connection() as db:
-        db.execute("UPDATE plan_catalog SET active=0,is_recommended=0,updated_at=? WHERE plan_key=?", (now_iso(), plan_key))
+        db.plan_catalog.update_one({"key": plan_key}, {"$set": {"active": False, "is_recommended": False, "updated_at": now_iso()}})
         _audit(db, "admin_plan_archived", user["id"], None, {"plan_key": plan_key})
         plans = _read_catalog(db)
     return {"plans": plans}

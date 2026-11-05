@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
 import threading
 import time
 import uuid
@@ -26,8 +25,9 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError, VerificationError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pymongo import ReturnDocument
 
-from backend.auth_store import AuthStore, DB_INTEGRITY_ERRORS, token_digest
+from backend.auth_store import AuthStore, DB_INTEGRITY_ERRORS, json_document, token_digest
 from backend.schemas import CropInput, Credentials, FarmerRecommendationRequest, FarmerRegistration, FarmerStatusUpdate, PasswordChange, ProfileUpdate, SchemeStatusUpdate
 
 router = APIRouter(prefix="/api")
@@ -80,28 +80,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _purge_expired_recommendations(db: sqlite3.Connection, now: datetime | None = None) -> int:
+def _purge_expired_recommendations(db, now: datetime | None = None) -> int:
     cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=RECOMMENDATION_RETENTION_DAYS)).isoformat()
-    expired_ids = {row["id"] for row in db.execute(
-        "SELECT id FROM recommendation_history WHERE created_at < ?", (cutoff,)
-    ).fetchall()}
+    expired_ids = [row["id"] for row in db.recommendation_history.find(
+        {"created_at": {"$lt": cutoff}}, {"id": 1})]
     if not expired_ids:
         return 0
-    cursor = db.execute("DELETE FROM recommendation_history WHERE created_at < ?", (cutoff,))
-    old_audit_rows = db.execute(
-        "SELECT id,detail_json FROM audit_logs WHERE action='recommendation_created'"
-    ).fetchall()
-    expired_audit_ids = []
-    for row in old_audit_rows:
-        try:
-            detail = json.loads(row["detail_json"])
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if detail.get("record_id") in expired_ids:
-            expired_audit_ids.append((row["id"],))
-    if expired_audit_ids:
-        db.executemany("DELETE FROM audit_logs WHERE id=?", expired_audit_ids)
-    return cursor.rowcount
+    deleted = db.recommendation_history.delete_many({"id": {"$in": expired_ids}}).deleted_count
+    db.audit_logs.delete_many({"action": "recommendation_created", "detail.record_id": {"$in": expired_ids}})
+    return deleted
 
 
 def _local_day_bounds_utc(now: datetime | None = None) -> tuple[str, str, datetime]:
@@ -152,10 +139,10 @@ def current_user(request: Request) -> dict:
     if not token or len(token) > 256:
         raise HTTPException(401, "Authentication required.")
     with store.connection() as db:
-        row = db.execute("""SELECT u.id, u.farmer_id, u.email, u.display_name, u.mobile_number, u.role, u.active, u.created_at,
-                            s.id AS session_id, s.expires_at
-                            FROM sessions s JOIN users u ON u.id=s.user_id
-                            WHERE s.token_hash=? AND s.revoked_at IS NULL""", (token_digest(token),)).fetchone()
+        session = db.sessions.find_one({"token_hash": token_digest(token), "revoked_at": None})
+        row = db.users.find_one({"id": session["user_id"]}) if session else None
+        if row and session:
+            row = {**row, "session_id": session["id"], "expires_at": session["expires_at"]}
     if not row:
         raise HTTPException(401, "Your session is no longer valid. Please sign in again.")
     if not row["active"]:
@@ -204,13 +191,13 @@ def farmer_geocode(q: Annotated[str, Query(min_length=3, max_length=200)], reque
             "state": state, "district": district}
 
 
-def _audit(db: sqlite3.Connection, action: str, actor: str | None = None,
+def _audit(db, action: str, actor: str | None = None,
            target: str | None = None, detail: dict | None = None) -> None:
-    db.execute("INSERT INTO audit_logs(id, actor_user_id, action, target_user_id, detail_json, created_at) VALUES(?,?,?,?,?,?)",
-               (str(uuid.uuid4()), actor, action, target, json.dumps(detail or {}, separators=(",", ":")), now_iso()))
+    db.audit_logs.insert_one({"id": str(uuid.uuid4()), "actor_user_id": actor, "action": action,
+                              "target_user_id": target, "detail": detail or {}, "created_at": now_iso()})
 
 
-def _safe_user(row: sqlite3.Row | dict) -> dict:
+def _safe_user(row: dict) -> dict:
     return {"id": row["id"], "email": row["email"], "display_name": row["display_name"],
             "farmer_id": row["farmer_id"] if row["role"] == "farmer" else None,
             "mobile_number": row["mobile_number"], "role": row["role"], "active": bool(row["active"]), "created_at": row["created_at"]}
@@ -226,8 +213,8 @@ def _start_session(response: Response, user_id: str) -> None:
     created = datetime.now(timezone.utc)
     expires = created + timedelta(hours=SESSION_HOURS)
     with store.connection() as db:
-        db.execute("INSERT INTO sessions(id,user_id,token_hash,created_at,expires_at) VALUES(?,?,?,?,?)",
-                   (str(uuid.uuid4()), user_id, token_digest(raw_token), created.isoformat(), expires.isoformat()))
+        db.sessions.insert_one({"id": str(uuid.uuid4()), "user_id": user_id, "token_hash": token_digest(raw_token),
+                                "created_at": created.isoformat(), "expires_at": expires.isoformat(), "revoked_at": None})
     response.set_cookie(COOKIE_NAME, raw_token, max_age=SESSION_HOURS * 3600, expires=expires,
                         httponly=True, secure=COOKIE_SECURE, samesite="lax", path="/api")
 
@@ -236,7 +223,7 @@ def _login(request: Request, response: Response, credentials: Credentials) -> di
     _check_origin(request)
     _rate_limit(request, "login", 10, 300)
     with store.connection() as db:
-        row = db.execute("SELECT * FROM users WHERE email=?", (credentials.email,)).fetchone()
+        row = db.users.find_one({"email": credentials.email})
         verified = False
         try:
             verified = password_hasher.verify(row["password_hash"] if row else DUMMY_PASSWORD_HASH, credentials.password)
@@ -265,8 +252,10 @@ def farmer_register(payload: FarmerRegistration, request: Request, response: Res
     digest = password_hasher.hash(payload.password)
     try:
         with store.connection() as db:
-            db.execute("INSERT INTO users(id,farmer_id,email,display_name,mobile_number,password_hash,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,'farmer',1,?,?)",
-                       (user_id, farmer_id, payload.email, payload.display_name, payload.mobile_number, digest, created, created))
+            db.users.insert_one({"id": user_id, "farmer_id": farmer_id, "email": payload.email,
+                "display_name": payload.display_name, "mobile_number": payload.mobile_number,
+                "password_hash": digest, "role": "farmer", "active": True,
+                "created_at": created, "updated_at": created})
             _audit(db, "farmer_registered", user_id, user_id)
     except DB_INTEGRITY_ERRORS as exc:
         raise HTTPException(409, "An account with that email already exists.") from exc
@@ -285,7 +274,7 @@ def request_farmer_password_reset(payload: PasswordResetRequest, request: Reques
         raise HTTPException(503, "Password reset email is not configured. Contact CropSense support.")
 
     with store.connection() as db:
-        user = db.execute("SELECT id,display_name FROM users WHERE email=? AND role='farmer' AND active=1", (payload.email,)).fetchone()
+        user = db.users.find_one({"email": payload.email, "role": "farmer", "active": True}, {"id": 1, "display_name": 1})
     if user:
         from backend.email_report import send_password_reset_otp
         otp = f"{secrets.randbelow(1_000_000):06d}"
@@ -294,14 +283,15 @@ def request_farmer_password_reset(payload: PasswordResetRequest, request: Reques
         created = datetime.now(timezone.utc)
         reset_id = str(uuid.uuid4())
         with store.connection() as db:
-            db.execute("UPDATE farmer_password_resets SET consumed_at=? WHERE user_id=? AND consumed_at IS NULL", (created.isoformat(), user["id"]))
-            db.execute("INSERT INTO farmer_password_resets(id,user_id,otp_hash,otp_salt,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                       (reset_id, user["id"], digest, salt.hex(), created.isoformat(), (created + timedelta(minutes=10)).isoformat()))
+            db.farmer_password_resets.update_many({"user_id": user["id"], "consumed_at": None}, {"$set": {"consumed_at": created.isoformat()}})
+            db.farmer_password_resets.insert_one({"id": reset_id, "user_id": user["id"], "otp_hash": digest,
+                "otp_salt": salt.hex(), "created_at": created.isoformat(),
+                "expires_at": (created + timedelta(minutes=10)).isoformat(), "consumed_at": None, "attempts": 0})
         try:
             send_password_reset_otp(recipient=payload.email, otp=otp, smtp_email=smtp_email, smtp_app_password=smtp_password)
         except Exception as exc:
             with store.connection() as db:
-                db.execute("UPDATE farmer_password_resets SET consumed_at=? WHERE id=?", (now_iso(), reset_id))
+                db.farmer_password_resets.update_one({"id": reset_id}, {"$set": {"consumed_at": now_iso()}})
             logger.error("Farmer password reset email failed user_id=%s error_type=%s", user["id"], type(exc).__name__)
     return {"message": "If an active farmer account uses this email, a reset code will be sent shortly."}
 
@@ -311,9 +301,8 @@ def complete_farmer_password_reset(payload: PasswordResetComplete, request: Requ
     _check_origin(request)
     _rate_limit(request, "farmer-password-reset-complete", 8, 600)
     with store.connection() as db:
-        user = db.execute("SELECT id FROM users WHERE email=? AND role='farmer' AND active=1", (payload.email,)).fetchone()
-        reset = db.execute("SELECT * FROM farmer_password_resets WHERE user_id=? AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1",
-                           (user["id"],)).fetchone() if user else None
+        user = db.users.find_one({"email": payload.email, "role": "farmer", "active": True}, {"id": 1})
+        reset = db.farmer_password_resets.find_one({"user_id": user["id"], "consumed_at": None}, sort=[("created_at", -1)]) if user else None
         now = datetime.now(timezone.utc)
         valid = False
         if reset and reset["attempts"] < 5 and reset["expires_at"] > now.isoformat():
@@ -321,14 +310,13 @@ def complete_farmer_password_reset(payload: PasswordResetComplete, request: Requ
             valid = secrets.compare_digest(actual, reset["otp_hash"])
             if not valid:
                 attempts = reset["attempts"] + 1
-                db.execute("UPDATE farmer_password_resets SET attempts=?,consumed_at=? WHERE id=?",
-                           (attempts, now_iso() if attempts >= 5 else None, reset["id"]))
+                db.farmer_password_resets.update_one({"id": reset["id"]}, {"$set": {
+                    "attempts": attempts, "consumed_at": now_iso() if attempts >= 5 else None}})
         if valid:
             updated = now_iso()
-            db.execute("UPDATE users SET password_hash=?,updated_at=? WHERE id=? AND role='farmer'",
-                       (password_hasher.hash(payload.new_password), updated, user["id"]))
-            db.execute("UPDATE farmer_password_resets SET consumed_at=? WHERE id=?", (updated, reset["id"]))
-            db.execute("UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (updated, user["id"]))
+            db.users.update_one({"id": user["id"], "role": "farmer"}, {"$set": {"password_hash": password_hasher.hash(payload.new_password), "updated_at": updated}})
+            db.farmer_password_resets.update_one({"id": reset["id"]}, {"$set": {"consumed_at": updated}})
+            db.sessions.update_many({"user_id": user["id"], "revoked_at": None}, {"$set": {"revoked_at": updated}})
             _audit(db, "farmer_password_reset", user["id"], user["id"])
     if not valid:
         raise HTTPException(400, "The reset code is invalid or expired. Request a new code and try again.")
@@ -350,8 +338,7 @@ def logout(request: Request, response: Response, user: CurrentUser):
     _check_origin(request)
     token = request.cookies.get(COOKIE_NAME, "")
     with store.connection() as db:
-        db.execute("UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
-                   (now_iso(), token_digest(token)))
+        db.sessions.update_one({"token_hash": token_digest(token), "revoked_at": None}, {"$set": {"revoked_at": now_iso()}})
         _audit(db, "logout", user["id"], user["id"])
     response.delete_cookie(COOKIE_NAME, path="/api", httponly=True, secure=COOKIE_SECURE, samesite="lax")
     return {"status": "signed_out"}
@@ -366,10 +353,10 @@ def farmer_profile(user: FarmerUser):
 def update_farmer_profile(payload: ProfileUpdate, request: Request, user: FarmerUser):
     _check_origin(request)
     with store.connection() as db:
-        db.execute("UPDATE users SET display_name=?, mobile_number=?, updated_at=? WHERE id=? AND role='farmer'",
-                   (payload.display_name, payload.mobile_number, now_iso(), user["id"]))
+        db.users.update_one({"id": user["id"], "role": "farmer"}, {"$set": {
+            "display_name": payload.display_name, "mobile_number": payload.mobile_number, "updated_at": now_iso()}})
         _audit(db, "farmer_profile_updated", user["id"], user["id"])
-        row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        row = db.users.find_one({"id": user["id"]})
     return {"user": _safe_user(row)}
 
 
@@ -377,7 +364,7 @@ def update_farmer_profile(payload: ProfileUpdate, request: Request, user: Farmer
 def change_farmer_password(payload: PasswordChange, request: Request, user: FarmerUser):
     _check_origin(request)
     with store.connection() as db:
-        row = db.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+        row = db.users.find_one({"id": user["id"]}, {"password_hash": 1})
         try:
             valid = password_hasher.verify(row["password_hash"], payload.current_password)
         except (VerifyMismatchError, VerificationError, InvalidHashError):
@@ -385,10 +372,8 @@ def change_farmer_password(payload: PasswordChange, request: Request, user: Farm
         if not valid:
             raise HTTPException(400, "Current password is incorrect.")
         updated = now_iso()
-        db.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
-                   (password_hasher.hash(payload.new_password), updated, user["id"]))
-        db.execute("UPDATE sessions SET revoked_at=? WHERE user_id=? AND id<>? AND revoked_at IS NULL",
-                   (updated, user["id"], user["session_id"]))
+        db.users.update_one({"id": user["id"]}, {"$set": {"password_hash": password_hasher.hash(payload.new_password), "updated_at": updated}})
+        db.sessions.update_many({"user_id": user["id"], "id": {"$ne": user["session_id"]}, "revoked_at": None}, {"$set": {"revoked_at": updated}})
         _audit(db, "farmer_password_changed", user["id"], user["id"])
     return {"status": "password_changed"}
 
@@ -397,18 +382,14 @@ def change_farmer_password(payload: PasswordChange, request: Request, user: Farm
 def farmer_history(user: FarmerUser, limit: Annotated[int, Query(ge=1, le=10)] = 10,
                    offset: Annotated[int, Query(ge=0)] = 0, q: str = ""):
     search = q.strip()[:100]
-    where = "user_id=?"
-    params: list[object] = [user["id"]]
+    query: dict = {"user_id": user["id"]}
     if search:
-        pattern = f"%{search}%"
-        where += " AND (location_name LIKE ? OR recommendations_json LIKE ? OR input_json LIKE ? OR farm_district LIKE ? OR farm_state LIKE ?)"
-        params.extend([pattern] * 5)
+        query["search_text"] = {"$regex": re.escape(search), "$options": "i"}
     with store.connection() as db:
-        total = db.execute(f"SELECT COUNT(*) FROM recommendation_history WHERE {where}", params).fetchone()[0]
-        rows = db.execute(f"SELECT id,report_number,created_at,input_json,recommendations_json,model_name,model_version,location_name,latitude,longitude,location_source,land_area_acres,village_town,farm_district,farm_state FROM recommendation_history WHERE {where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
-                          (*params, limit, offset)).fetchall()
-    return {"items": [{"id": row["id"], "report_id": f"{row['report_number']:05d}", "created_at": row["created_at"], "inputs": json.loads(row["input_json"]),
-                       "recommendations": json.loads(row["recommendations_json"]), "model_name": row["model_name"],
+        total = db.recommendation_history.count_documents(query)
+        rows = list(db.recommendation_history.find(query, {"_id": 0}).sort([("created_at", -1), ("id", -1)]).skip(offset).limit(limit))
+    return {"items": [{"id": row["id"], "report_id": f"{row['report_number']:05d}", "created_at": row["created_at"], "inputs": row["inputs"],
+                       "recommendations": row["recommendations"], "model_name": row["model_name"],
                        "model_version": row["model_version"], "location_name": row["location_name"],
                        "latitude": row["latitude"], "longitude": row["longitude"], "location_source": row["location_source"],
                        "village_town": row["village_town"], "farm_district": row["farm_district"], "farm_state": row["farm_state"],
@@ -420,21 +401,14 @@ def farmer_history(user: FarmerUser, limit: Annotated[int, Query(ge=1, le=10)] =
 def farmer_schemes(user: FarmerUser):
     from backend.schemes import SCHEMES
     with store.connection() as db:
-        tracking_rows = db.execute(
-            "SELECT scheme_id,application_status,updated_at FROM farmer_scheme_tracking WHERE user_id=?",
-            (user["id"],),
-        ).fetchall()
-        latest = db.execute(
-            "SELECT recommendations_json,location_name,village_town,farm_district,farm_state,land_area_acres "
-            "FROM recommendation_history WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
-            (user["id"],),
-        ).fetchone()
-    tracking = {row["scheme_id"]: dict(row) for row in tracking_rows}
+        tracking_rows = db.farmer_scheme_tracking.find({"user_id": user["id"]}, {"_id": 0})
+        latest = db.recommendation_history.find_one({"user_id": user["id"]}, {"_id": 0}, sort=[("created_at", -1), ("id", -1)])
+    tracking = {row["scheme_id"]: row for row in tracking_rows}
     context = None
     if latest:
         try:
-            recommendations = json.loads(latest["recommendations_json"])
-        except (TypeError, json.JSONDecodeError):
+            recommendations = latest["recommendations"]
+        except (TypeError, KeyError):
             recommendations = []
         context = {
             "location_name": latest["location_name"], "village_town": latest["village_town"],
@@ -456,10 +430,10 @@ def save_farmer_scheme(scheme_id: str, request: Request, user: FarmerUser):
     _check_origin(request)
     updated = now_iso()
     with store.connection() as db:
-        db.execute("""INSERT INTO farmer_scheme_tracking(user_id,scheme_id,application_status,updated_at)
-                    VALUES(?,?,'not_started',?) ON CONFLICT(user_id,scheme_id) DO UPDATE SET updated_at=excluded.updated_at""",
-                   (user["id"], scheme_id, updated))
-    return {"scheme_id": scheme_id, "saved": True, "application_status": "not_started", "updated_at": updated}
+        row = db.farmer_scheme_tracking.find_one_and_update({"user_id": user["id"], "scheme_id": scheme_id},
+            {"$setOnInsert": {"application_status": "not_started"}, "$set": {"updated_at": updated}},
+            upsert=True, return_document=ReturnDocument.AFTER)
+    return {"scheme_id": scheme_id, "saved": True, "application_status": row["application_status"], "updated_at": updated}
 
 
 @router.delete("/farmer/schemes/{scheme_id}", status_code=204)
@@ -469,7 +443,7 @@ def unsave_farmer_scheme(scheme_id: str, request: Request, user: FarmerUser):
         raise HTTPException(404, "Scheme not found.")
     _check_origin(request)
     with store.connection() as db:
-        db.execute("DELETE FROM farmer_scheme_tracking WHERE user_id=? AND scheme_id=?", (user["id"], scheme_id))
+        db.farmer_scheme_tracking.delete_one({"user_id": user["id"], "scheme_id": scheme_id})
 
 
 @router.patch("/farmer/schemes/{scheme_id}/status")
@@ -480,9 +454,9 @@ def update_farmer_scheme_status(scheme_id: str, payload: SchemeStatusUpdate, req
     _check_origin(request)
     updated = now_iso()
     with store.connection() as db:
-        cursor = db.execute("UPDATE farmer_scheme_tracking SET application_status=?,updated_at=? WHERE user_id=? AND scheme_id=?",
-                            (payload.application_status, updated, user["id"], scheme_id))
-        if not cursor.rowcount:
+        result = db.farmer_scheme_tracking.update_one({"user_id": user["id"], "scheme_id": scheme_id},
+            {"$set": {"application_status": payload.application_status, "updated_at": updated}})
+        if not result.matched_count:
             raise HTTPException(404, "Save this scheme before tracking its application.")
     return {"scheme_id": scheme_id, "application_status": payload.application_status, "updated_at": updated}
 
@@ -525,29 +499,23 @@ def farmer_recommend(payload: FarmerRecommendationRequest, request: Request, use
         }))
     result = result.model_copy(update={"recommendations": recommendations})
     with store.connection() as db:
-        # Serialize report numbering per farmer on both SQLite and PostgreSQL.
-        if store.uses_postgres:
-            db.execute("BEGIN")
-            db.execute("SELECT id FROM users WHERE id=? FOR UPDATE", (user["id"],))
-        else:
-            db.execute("BEGIN IMMEDIATE")
-        counter = db.execute("SELECT last_report_number FROM farmer_report_counters WHERE user_id=?", (user["id"],)).fetchone()
-        max_history_number = db.execute(
-            "SELECT COALESCE(MAX(report_number), 0) FROM recommendation_history WHERE user_id=?", (user["id"],)
-        ).fetchone()[0]
-        previous_number = max(counter["last_report_number"] if counter else 0, max_history_number)
-        report_number = previous_number + 1
+        counter = db.farmer_report_counters.find_one_and_update({"user_id": user["id"]},
+            {"$inc": {"last_report_number": 1}, "$setOnInsert": {"user_id": user["id"]}},
+            upsert=True, return_document=ReturnDocument.AFTER)
+        report_number = counter["last_report_number"]
         if report_number > 99999:
             raise HTTPException(409, "This farmer account has reached the five-digit recommendation report ID limit.")
         record_id = str(uuid.uuid4())
-        db.execute("INSERT INTO recommendation_history(id,user_id,report_number,created_at,input_json,recommendations_json,model_name,model_version,location_name,latitude,longitude,location_source,land_area_acres,village_town,farm_district,farm_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (record_id, user["id"], report_number, now_iso(), json.dumps(payload.model_dump(include=set(CropInput.model_fields)), separators=(",", ":")),
-                    json.dumps([item.model_dump() for item in result.recommendations], separators=(",", ":")),
-                    result.model_name, result.model_version, payload.location_name, payload.latitude, payload.longitude, payload.location_source,
-                    payload.land_area_acres, payload.village_town.strip(), payload.farm_district.strip(), payload.farm_state.strip()))
-        db.execute("INSERT INTO farmer_report_counters(user_id,last_report_number) VALUES(?,?) "
-                   "ON CONFLICT(user_id) DO UPDATE SET last_report_number=excluded.last_report_number",
-                   (user["id"], report_number))
+        inputs = payload.model_dump(include=set(CropInput.model_fields))
+        recommendation_docs = [item.model_dump() for item in result.recommendations]
+        db.recommendation_history.insert_one({"id": record_id, "user_id": user["id"], "report_number": report_number,
+            "created_at": now_iso(), "inputs": inputs, "recommendations": recommendation_docs,
+            "search_text": json_document({"inputs": inputs, "recommendations": recommendation_docs,
+                "location_name": payload.location_name, "farm_district": payload.farm_district, "farm_state": payload.farm_state}).lower(),
+            "model_name": result.model_name, "model_version": result.model_version, "location_name": payload.location_name,
+            "latitude": payload.latitude, "longitude": payload.longitude, "location_source": payload.location_source,
+            "land_area_acres": payload.land_area_acres, "village_town": payload.village_town.strip(),
+            "farm_district": payload.farm_district.strip(), "farm_state": payload.farm_state.strip()})
         _audit(db, "recommendation_created", user["id"], user["id"], {"record_id": record_id, "location_name": payload.location_name,
                "land_area_acres": payload.land_area_acres})
     return result.model_copy(update={"report_id": f"{report_number:05d}"})
@@ -560,45 +528,61 @@ def admin_overview(user: AdminUser):
     trend_start = datetime.combine(trend_start_day, datetime.min.time(), tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc).isoformat()
     selection_cutoff = (local_now - timedelta(days=30)).astimezone(timezone.utc).isoformat()
     with store.connection() as db:
-        farmers = db.execute("SELECT COUNT(*) AS total, SUM(active) AS active FROM users WHERE role='farmer'").fetchone()
-        recommendation_count = db.execute("SELECT COUNT(*) FROM recommendation_history").fetchone()[0]
-        today_count = db.execute("SELECT COUNT(*) FROM recommendation_history WHERE created_at>=? AND created_at<?", (today_start, today_end)).fetchone()[0]
-        logged_in_users = db.execute("SELECT COUNT(DISTINCT actor_user_id) FROM audit_logs WHERE action IN ('admin_login','farmer_login')").fetchone()[0]
-        trend_rows = db.execute("SELECT created_at,recommendations_json FROM recommendation_history WHERE created_at>=? AND created_at<? ORDER BY created_at DESC", (trend_start, today_end)).fetchall()
+        farmers_total = db.users.count_documents({"role": "farmer"})
+        farmers_active = db.users.count_documents({"role": "farmer", "active": True})
+        recommendation_count = db.recommendation_history.count_documents({})
+        date_filter = {"created_at": {"$gte": today_start, "$lt": today_end}}
+        today_count = db.recommendation_history.count_documents(date_filter)
+        logged_in_users = len(db.audit_logs.distinct("actor_user_id", {
+            "action": {"$in": ["admin_login", "farmer_login"]}, "actor_user_id": {"$ne": None}}))
         trend_counts: dict[str, int] = {}
         crop_counts: dict[str, int] = {}
-        for row in trend_rows:
+        for row in db.recommendation_history.find(
+                {"created_at": {"$gte": trend_start, "$lt": today_end}},
+                {"created_at": 1, "recommendations": 1}):
             day = datetime.fromisoformat(row["created_at"]).astimezone(ZoneInfo("Asia/Kolkata")).date().isoformat()
             trend_counts[day] = trend_counts.get(day, 0) + 1
-            try:
-                crops = json.loads(row["recommendations_json"])
-            except (TypeError, json.JSONDecodeError):
-                crops = []
-            for crop in crops if isinstance(crops, list) else []:
+            for crop in row.get("recommendations", []):
                 if isinstance(crop, dict) and crop.get("crop"):
                     name = str(crop["crop"])
                     crop_counts[name] = crop_counts.get(name, 0) + 1
-        trend = [{"date": (trend_start_day + timedelta(days=index)).isoformat(), "count": trend_counts.get((trend_start_day + timedelta(days=index)).isoformat(), 0)} for index in range(30)]
-        today_rows = db.execute("""SELECT r.id,r.report_number,r.created_at,r.recommendations_json,r.location_name,
-                            u.email,u.display_name,u.farmer_id FROM recommendation_history r JOIN users u ON u.id=r.user_id
-                            WHERE r.created_at>=? AND r.created_at<? ORDER BY r.created_at DESC LIMIT 5""",
-                                (today_start, today_end)).fetchall()
-        today_items = [{"id": row["id"], "report_id": f"{row['report_number']:05d}", "created_at": row["created_at"],
-                        "farmer_email": row["email"], "farmer_name": row["display_name"], "farmer_id": row["farmer_id"],
-                        "location_name": row["location_name"], "recommendations": json.loads(row["recommendations_json"])} for row in today_rows]
-        top_crops = sorted(({"crop": crop, "count": count} for crop, count in crop_counts.items()), key=lambda item: (-item["count"], item["crop"]))[:5]
-        popular_plans = db.execute("""SELECT s.plan_key AS key,COALESCE(NULLIF(p.display_name,''),s.plan_key) AS name,COUNT(*) AS count
-                                      FROM plan_selections s JOIN plan_catalog p ON p.plan_key=s.plan_key
-                                      WHERE s.selected_at>=? GROUP BY s.plan_key ORDER BY count DESC,name LIMIT 5""",
-                                   (selection_cutoff,)).fetchall()
-        payment_summary = db.execute("SELECT COALESCE(SUM(amount_inr),0) AS revenue,COUNT(*) AS payments FROM plan_payment_records WHERE status='paid'").fetchone()
-        return {"farmers_total": farmers["total"] or 0, "farmers_active": farmers["active"] or 0,
-                "recommendations_total": recommendation_count, "recommendations_today": today_count,
-                "recommendation_trend": trend, "today_recommendations": today_items, "top_crops_30_days": top_crops,
-                "popular_plans_30_days": [dict(row) for row in popular_plans],
-                "revenue_inr": payment_summary["revenue"], "payments_recorded": payment_summary["payments"],
-                "users_logged_in": logged_in_users, "recommendation_form_submissions": recommendation_count,
-                "users_currently_signed_in": db.execute("SELECT COUNT(DISTINCT s.user_id) FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.revoked_at IS NULL AND s.expires_at>? AND u.active=1", (now_iso(),)).fetchone()[0]}
+        trend = [{"date": (trend_start_day + timedelta(days=i)).isoformat(),
+                  "count": trend_counts.get((trend_start_day + timedelta(days=i)).isoformat(), 0)}
+                 for i in range(30)]
+        today_rows = list(db.recommendation_history.find(date_filter, {"_id": 0}).sort("created_at", -1).limit(5))
+        farmer_rows = {row["id"]: row for row in db.users.find(
+            {"id": {"$in": [item["user_id"] for item in today_rows]}},
+            {"id": 1, "email": 1, "display_name": 1, "farmer_id": 1})}
+        today_items = [{
+            "id": row["id"], "report_id": f"{row['report_number']:05d}", "created_at": row["created_at"],
+            "farmer_email": farmer_rows.get(row["user_id"], {}).get("email"),
+            "farmer_name": farmer_rows.get(row["user_id"], {}).get("display_name"),
+            "farmer_id": farmer_rows.get(row["user_id"], {}).get("farmer_id"),
+            "location_name": row.get("location_name"), "recommendations": row.get("recommendations", [])
+        } for row in today_rows]
+        top_crops = sorted(({"crop": crop, "count": count} for crop, count in crop_counts.items()),
+                           key=lambda item: (-item["count"], item["crop"]))[:5]
+        plan_counts: dict[str, int] = {}
+        for selection in db.plan_selections.find({"selected_at": {"$gte": selection_cutoff}}, {"plan_key": 1}):
+            key = selection["plan_key"]
+            plan_counts[key] = plan_counts.get(key, 0) + 1
+        plan_names = {p["key"]: (p.get("display_name") or p["key"]) for p in db.plan_catalog.find(
+            {"key": {"$in": list(plan_counts)}})}
+        popular_plans = sorted(({"key": key, "name": plan_names.get(key, key), "count": count}
+                                for key, count in plan_counts.items()),
+                               key=lambda item: (-item["count"], item["name"]))[:5]
+        paid_rows = list(db.plan_payment_records.find({"status": "paid"}, {"amount_inr": 1}))
+        signed_ids = db.sessions.distinct("user_id", {"revoked_at": None, "expires_at": {"$gt": now_iso()}})
+        signed_in = db.users.count_documents({"id": {"$in": signed_ids}, "active": True})
+        return {
+            "farmers_total": farmers_total, "farmers_active": farmers_active,
+            "recommendations_total": recommendation_count, "recommendations_today": today_count,
+            "recommendation_trend": trend, "today_recommendations": today_items, "top_crops_30_days": top_crops,
+            "popular_plans_30_days": popular_plans,
+            "revenue_inr": sum(int(row.get("amount_inr", 0)) for row in paid_rows),
+            "payments_recorded": len(paid_rows), "users_logged_in": logged_in_users,
+            "recommendation_form_submissions": recommendation_count, "users_currently_signed_in": signed_in,
+        }
 
 
 @router.get("/admin/farmers")
@@ -606,19 +590,14 @@ def admin_farmers(user: AdminUser, q: str = "", status: str = "all", limit: int 
     if status not in {"all", "active", "suspended"}:
         raise HTTPException(422, "Status must be all, active, or suspended.")
     limit, offset = min(max(limit, 1), 200), max(offset, 0)
-    query = "SELECT * FROM users WHERE role='farmer'"
-    params: list[object] = []
+    query: dict = {"role": "farmer"}
     if q.strip():
-        query += " AND (email LIKE ? OR display_name LIKE ?)"
-        pattern = f"%{q.strip()[:100]}%"
-        params.extend((pattern, pattern))
+        pattern = {"$regex": re.escape(q.strip()[:100]), "$options": "i"}
+        query["$or"] = [{"email": pattern}, {"display_name": pattern}]
     if status != "all":
-        query += " AND active=?"
-        params.append(1 if status == "active" else 0)
-    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    params.extend((limit, offset))
+        query["active"] = status == "active"
     with store.connection() as db:
-        rows = db.execute(query, params).fetchall()
+        rows = db.users.find(query, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit)
     return {"items": [_safe_user(row) for row in rows]}
 
 
@@ -626,17 +605,19 @@ def admin_farmers(user: AdminUser, q: str = "", status: str = "all", limit: int 
 def admin_set_farmer_status(farmer_id: str, payload: FarmerStatusUpdate, request: Request, user: AdminUser):
     _check_origin(request)
     with store.connection() as db:
-        farmer = db.execute("SELECT id,email,active FROM users WHERE id=? AND role='farmer'", (farmer_id,)).fetchone()
+        farmer = db.users.find_one({"id": farmer_id, "role": "farmer"})
         if not farmer:
             raise HTTPException(404, "Farmer account not found.")
         if bool(farmer["active"]) != payload.active:
             changed = now_iso()
-            db.execute("UPDATE users SET active=?,updated_at=? WHERE id=? AND role='farmer'", (int(payload.active), changed, farmer_id))
+            db.users.update_one({"id": farmer_id, "role": "farmer"},
+                                {"$set": {"active": payload.active, "updated_at": changed}})
             if not payload.active:
-                db.execute("UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (changed, farmer_id))
-            _audit(db, "farmer_activated" if payload.active else "farmer_suspended", user["id"], farmer_id,
-                   {"email": farmer["email"]})
-        row = db.execute("SELECT * FROM users WHERE id=?", (farmer_id,)).fetchone()
+                db.sessions.update_many({"user_id": farmer_id, "revoked_at": None},
+                                         {"$set": {"revoked_at": changed}})
+            _audit(db, "farmer_activated" if payload.active else "farmer_suspended",
+                   user["id"], farmer_id, {"email": farmer["email"]})
+        row = db.users.find_one({"id": farmer_id})
     return {"user": _safe_user(row)}
 
 
@@ -644,28 +625,34 @@ def admin_set_farmer_status(farmer_id: str, payload: FarmerStatusUpdate, request
 def admin_activity(user: AdminUser, limit: int = 100, offset: int = 0):
     limit, offset = min(max(limit, 1), 200), max(offset, 0)
     with store.connection() as db:
-        total = db.execute("SELECT COUNT(*) FROM recommendation_history").fetchone()[0]
-        rows = db.execute("""SELECT r.id,r.created_at,r.recommendations_json,r.model_name,r.model_version,r.location_name,u.email,u.display_name,u.farmer_id
-                            FROM recommendation_history r JOIN users u ON u.id=r.user_id
-                            ORDER BY r.created_at DESC LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
-    return {"items": [{"id": row["id"], "created_at": row["created_at"], "farmer_id": row["farmer_id"], "farmer_email": row["email"],
-                       "farmer_name": row["display_name"], "recommendations": json.loads(row["recommendations_json"]),
-                       "location_name": row["location_name"], "model_name": row["model_name"], "model_version": row["model_version"]} for row in rows], "total": total, "limit": limit, "offset": offset}
+        total = db.recommendation_history.count_documents({})
+        rows = list(db.recommendation_history.find({}, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit))
+        users = {row["id"]: row for row in db.users.find(
+            {"id": {"$in": [item["user_id"] for item in rows]}},
+            {"id": 1, "email": 1, "display_name": 1, "farmer_id": 1})}
+    items = [{"id": row["id"], "created_at": row["created_at"],
+              "farmer_id": users.get(row["user_id"], {}).get("farmer_id"),
+              "farmer_email": users.get(row["user_id"], {}).get("email"),
+              "farmer_name": users.get(row["user_id"], {}).get("display_name"),
+              "recommendations": row.get("recommendations", []), "location_name": row.get("location_name"),
+              "model_name": row.get("model_name"), "model_version": row.get("model_version")}
+             for row in rows]
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/admin/audit")
 def admin_audit(user: AdminUser, limit: int = 100, offset: int = 0):
     limit, offset = min(max(limit, 1), 200), max(offset, 0)
     with store.connection() as db:
-        total = db.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
-        rows = db.execute("""SELECT a.id,a.action,a.detail_json,a.created_at,actor.email AS actor_email,
-                            target.email AS target_email FROM audit_logs a
-                            LEFT JOIN users actor ON actor.id=a.actor_user_id
-                            LEFT JOIN users target ON target.id=a.target_user_id
-                            ORDER BY a.created_at DESC LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
-    return {"items": [{"id": row["id"], "action": row["action"], "detail": json.loads(row["detail_json"]),
-                       "created_at": row["created_at"], "actor_email": row["actor_email"],
-                       "target_email": row["target_email"]} for row in rows], "total": total, "limit": limit, "offset": offset}
+        total = db.audit_logs.count_documents({})
+        rows = list(db.audit_logs.find({}, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit))
+        ids = {value for row in rows for value in (row.get("actor_user_id"), row.get("target_user_id")) if value}
+        users = {row["id"]: row for row in db.users.find({"id": {"$in": list(ids)}}, {"id": 1, "email": 1})}
+    items = [{"id": row["id"], "action": row["action"], "detail": row.get("detail", {}),
+              "created_at": row["created_at"],
+              "actor_email": users.get(row.get("actor_user_id"), {}).get("email"),
+              "target_email": users.get(row.get("target_user_id"), {}).get("email")} for row in rows]
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/admin/system")

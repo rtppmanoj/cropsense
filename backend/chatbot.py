@@ -129,17 +129,10 @@ def _authenticated_farmer_context(request: Request, needs_results: bool, needs_s
     context: dict = {"farmer_account": "signed in"}
     with store.connection() as db:
         if needs_results:
-            row = db.execute(
-                "SELECT report_number,created_at,input_json,recommendations_json,location_name,farm_district,farm_state "
-                "FROM recommendation_history WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
-                (user["id"],),
-            ).fetchone()
+            row = db.recommendation_history.find_one({"user_id": user["id"]}, {"_id": 0}, sort=[("created_at", -1), ("id", -1)])
             if row:
-                try:
-                    inputs = json.loads(row["input_json"])
-                    recommendations = json.loads(row["recommendations_json"])
-                except (TypeError, json.JSONDecodeError):
-                    inputs, recommendations = {}, []
+                inputs = row.get("inputs", {})
+                recommendations = row.get("recommendations", [])
                 context["latest_saved_recommendation"] = {
                     "report_id": f"{row['report_number']:05d}",
                     "created_at": row["created_at"],
@@ -158,11 +151,8 @@ def _authenticated_farmer_context(request: Request, needs_results: bool, needs_s
             else:
                 context["latest_saved_recommendation"] = None
         if needs_schemes:
-            rows = db.execute(
-                "SELECT scheme_id,application_status,updated_at FROM farmer_scheme_tracking WHERE user_id=?",
-                (user["id"],),
-            ).fetchall()
-            context["saved_scheme_tracking"] = [dict(row) for row in rows]
+            rows = db.farmer_scheme_tracking.find({"user_id": user["id"]}, {"_id": 0, "scheme_id": 1, "application_status": 1, "updated_at": 1})
+            context["saved_scheme_tracking"] = list(rows)
     return context
 
 

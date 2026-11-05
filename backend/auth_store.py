@@ -1,180 +1,109 @@
-"""SQLite locally and managed PostgreSQL persistence for CropSense data."""
+"""MongoDB persistence for CropSense accounts and farmer data."""
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-try:
-    import psycopg
-    from psycopg.rows import tuple_row
-except ImportError:  # SQLite-only local setups need not install the PostgreSQL driver.
-    psycopg = None
-    tuple_row = None
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
-if psycopg is not None:
-    DB_ERRORS = (sqlite3.Error, psycopg.Error)
-    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
-else:
-    DB_ERRORS = (sqlite3.Error,)
-    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
-
-
+DB_ERRORS = (PyMongoError,)
+DB_INTEGRITY_ERRORS = (DuplicateKeyError,)
 ROOT = Path(__file__).resolve().parents[1]
 
-
-def configured_db_path() -> Path:
-    configured = os.getenv("CROPSENSE_DB_PATH", "data/cropsense.sqlite3")
-    path = Path(configured)
-    return path if path.is_absolute() else (ROOT / path).resolve()
+DEFAULT_PLANS = [
+    {"key": "free", "price_inr": 0, "annual_limit": 3, "is_recommended": False,
+     "features": ["cropRecommendations", "weatherOutlook", "governmentSchemes", "onlineResults", "chatbotFeature"]},
+    {"key": "basic", "price_inr": 49, "annual_limit": 5, "is_recommended": False,
+     "features": ["cropRecommendations", "weatherOutlook", "governmentSchemes", "onlineResults", "fertilizerRecommendations", "pdfDownload", "emailReports", "eligibilityGuidance", "savedHistory", "chatbotFeature"]},
+    {"key": "plus", "price_inr": 149, "annual_limit": 15, "is_recommended": True,
+     "features": ["cropRecommendations", "weatherOutlook", "governmentSchemes", "onlineResults", "fertilizerRecommendations", "pdfDownload", "emailReports", "eligibilityGuidance", "savedHistory", "marketPriceInsights", "disasterAssistance", "chatbotFeature"]},
+    {"key": "premium", "price_inr": 399, "annual_limit": 50, "is_recommended": False,
+     "features": ["cropRecommendations", "weatherOutlook", "governmentSchemes", "onlineResults", "fertilizerRecommendations", "pdfDownload", "emailReports", "eligibilityGuidance", "savedHistory", "marketPriceInsights", "disasterAssistance", "higherQuota", "chatbotFeature"]},
+    {"key": "organizationStarter", "price_inr": 999, "annual_limit": 500, "is_recommended": False,
+     "features": ["cropRecommendations", "weatherContext", "onlineResultsReports"]},
+    {"key": "organizationGrowth", "price_inr": 2499, "annual_limit": 2000, "is_recommended": False,
+     "features": ["cropRecommendations", "weatherContext", "onlineResultsReports"]},
+]
 
 
 class AuthStore:
-    def __init__(self, path: Path | None = None):
-        self.path = path
+    """Owns one MongoClient per worker; MongoClient itself is thread-safe."""
+
+    def __init__(self):
+        self._client: MongoClient | None = None
+        self._database = None
+        self._initialized_name: str | None = None
 
     @property
-    def db_path(self) -> Path:
-        return self.path or configured_db_path()
+    def uses_mongodb(self) -> bool:
+        return True
 
-    @property
-    def uses_postgres(self) -> bool:
-        return bool(os.getenv("DATABASE_URL", "").strip())
+    def _get_database(self):
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            raise RuntimeError("MONGODB_URI must be configured. SQLite storage has been removed.")
+        database_name = os.getenv("MONGODB_DATABASE", "cropsense").strip() or "cropsense"
+        if self._client is None or self._database.name != database_name:
+            if self._client is not None:
+                self._client.close()
+            self._client = MongoClient(uri, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000,
+                                       appname="CropSense", retryWrites=True)
+            self._database = self._client[database_name]
+            self._initialized_name = None
+        if self._initialized_name != database_name:
+            self._client.admin.command("ping")
+            self._initialize(self._database)
+            self._initialized_name = database_name
+        return self._database
+
+    def check(self) -> None:
+        if self._client is None:
+            self._get_database()
+        else:
+            self._client.admin.command("ping")
 
     @contextmanager
     def connection(self) -> Iterator[object]:
-        database_url = os.getenv("DATABASE_URL", "").strip()
-        if database_url:
-            if psycopg is None:
-                raise RuntimeError("DATABASE_URL is set, but psycopg is not installed. Install the backend requirements.")
-            if database_url.startswith("postgres://"):
-                database_url = "postgresql://" + database_url.removeprefix("postgres://")
-            connection = PostgresConnection(psycopg.connect(
-                database_url, row_factory=tuple_row, prepare_threshold=None, connect_timeout=10
-            ))
-            try:
-                self._initialize_postgres(connection)
-                connection.commit()
-                yield connection
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
-            return
-
-        path = self.db_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path, timeout=10, isolation_level="IMMEDIATE")
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        if os.name != "nt":
-            os.chmod(path, 0o600)
-        try:
-            self.initialize(connection)
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        yield self._get_database()
 
     @staticmethod
-    def initialize(connection: sqlite3.Connection) -> None:
-        connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-        applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
-        for migration in sorted((ROOT / "backend/migrations").glob("[0-9][0-9][0-9]_*.sql")):
-            version = int(migration.stem.split("_", 1)[0])
-            if version in applied:
-                continue
-            script = migration.read_text(encoding="utf-8")
-            connection.executescript(f"BEGIN IMMEDIATE;\n{script}\nINSERT INTO schema_migrations(version, applied_at) VALUES({version}, datetime('now'));\nCOMMIT;")
+    def _initialize(db) -> None:
+        db.users.create_index([("email", ASCENDING)], unique=True, name="users_email_unique")
+        db.users.create_index([("farmer_id", ASCENDING)], unique=True, sparse=True, name="users_farmer_id_unique")
+        db.sessions.create_index([("token_hash", ASCENDING)], unique=True, name="sessions_token_unique")
+        db.sessions.create_index([("user_id", ASCENDING), ("expires_at", ASCENDING)], name="sessions_user_expiry")
+        db.recommendation_history.create_index([("user_id", ASCENDING), ("created_at", DESCENDING), ("id", DESCENDING)], name="history_user_created")
+        db.recommendation_history.create_index([("user_id", ASCENDING), ("report_number", ASCENDING)], unique=True, name="history_report_unique")
+        db.recommendation_history.create_index([("created_at", ASCENDING)], name="history_created")
+        db.audit_logs.create_index([("created_at", DESCENDING)], name="audit_created")
+        db.audit_logs.create_index([("action", ASCENDING), ("actor_user_id", ASCENDING)], name="audit_action_actor")
+        db.farmer_scheme_tracking.create_index([("user_id", ASCENDING), ("scheme_id", ASCENDING)], unique=True, name="scheme_user_unique")
+        db.farmer_report_counters.create_index([("user_id", ASCENDING)], unique=True, name="report_counter_user_unique")
+        db.plan_catalog.create_index([("key", ASCENDING)], unique=True, name="plan_key_unique")
+        db.plan_selections.create_index([("selected_at", ASCENDING), ("plan_key", ASCENDING)], name="plan_selection_date")
+        db.plan_payment_records.create_index([("status", ASCENDING), ("paid_at", ASCENDING)], name="payment_status_date")
+        db.farmer_password_resets.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)], name="password_reset_user_created")
+        for plan in DEFAULT_PLANS:
+            db.plan_catalog.update_one({"key": plan["key"]}, {"$setOnInsert": {
+                **plan, "active": True, "display_name": None, "description": None, "updated_at": ""}}, upsert=True)
 
-    @staticmethod
-    def _initialize_postgres(connection: "PostgresConnection") -> None:
-        connection.execute("SELECT pg_advisory_xact_lock(1464087877, 1)")
-        connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-        applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations").fetchall()}
-        version = 1
-        if version in applied:
-            return
-        migration = ROOT / "backend/migrations_postgres/001_initial_schema.sql"
-        for statement in migration.read_text(encoding="utf-8").split(";"):
-            if statement.strip():
-                connection.execute(statement)
-        connection.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, CURRENT_TIMESTAMP::text)", (version,))
-
-
-class DbRow(dict):
-    """Mapping row that also preserves sqlite-style integer indexing."""
-
-    def __init__(self, columns: list[str], values: tuple):
-        super().__init__(zip(columns, values))
-        self._values = values
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return self._values[key]
-        return super().__getitem__(key)
-
-
-class PostgresCursor:
-    def __init__(self, cursor):
-        self._cursor = cursor
-
-    def _row(self, values):
-        if values is None:
-            return None
-        return DbRow([column.name for column in self._cursor.description], values)
-
-    def fetchone(self):
-        return self._row(self._cursor.fetchone())
-
-    def fetchall(self):
-        return [self._row(values) for values in self._cursor.fetchall()]
-
-    @property
-    def rowcount(self):
-        return self._cursor.rowcount
-
-
-class PostgresConnection:
-    """Small adapter for existing sqlite-style execute/fetch call sites."""
-
-    def __init__(self, connection):
-        self._connection = connection
-
-    @staticmethod
-    def _sql(query: str) -> str:
-        return query.replace("?", "%s")
-
-    @staticmethod
-    def _parameters(parameters):
-        return tuple(int(value) if isinstance(value, bool) else value for value in parameters)
-
-    def execute(self, query: str, parameters=()):
-        return PostgresCursor(self._connection.execute(self._sql(query), self._parameters(parameters)))
-
-    def executemany(self, query: str, parameter_sets):
-        cursor = self._connection.cursor()
-        cursor.executemany(self._sql(query), (self._parameters(parameters) for parameters in parameter_sets))
-        return PostgresCursor(cursor)
-
-    def commit(self):
-        self._connection.commit()
-
-    def rollback(self):
-        self._connection.rollback()
-
-    def close(self):
-        self._connection.close()
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+            self._database = None
+            self._initialized_name = None
 
 
 def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def json_document(value) -> str:
+    """Stable compact JSON used only to build searchable history text."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
