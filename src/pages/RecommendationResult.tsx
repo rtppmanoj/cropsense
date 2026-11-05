@@ -312,7 +312,7 @@ export default function RecommendationResult() {
     setDownloadMessage('');
     try {
       await apiFetch<{ status: string }>('/email-report', {
-        timeoutMs: 15_000, method: 'POST', body: JSON.stringify({ pdf_base64: preparedPdf.base64, filename: preparedPdf.filename }),
+        timeoutMs: 30_000, method: 'POST', body: JSON.stringify({ pdf_base64: preparedPdf.base64, filename: preparedPdf.filename }),
       });
       setDownloadMessage(t('results.emailSent', { email: user.email }));
       window.setTimeout(() => setDownloadMessage(''), 6000);

@@ -268,9 +268,10 @@ def farmer_register(payload: FarmerRegistration, request: Request, response: Res
 def request_farmer_password_reset(payload: PasswordResetRequest, request: Request):
     _check_origin(request)
     _rate_limit(request, "farmer-password-reset-request", 3, 3600)
-    smtp_email = os.getenv("SMTP_EMAIL", "").strip()
-    smtp_password = "".join(os.getenv("SMTP_APP_PASSWORD", "").split())
-    if smtp_email.lower() != "cropsensevit@gmail.com" or not smtp_password:
+    email_api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    sender_name = os.getenv("BREVO_SENDER_NAME", "CropSense").strip() or "CropSense"
+    if not email_api_key or not sender_email:
         raise HTTPException(503, "Password reset email is not configured. Contact CropSense support.")
 
     with store.connection() as db:
@@ -288,7 +289,8 @@ def request_farmer_password_reset(payload: PasswordResetRequest, request: Reques
                 "otp_salt": salt.hex(), "created_at": created.isoformat(),
                 "expires_at": (created + timedelta(minutes=10)).isoformat(), "consumed_at": None, "attempts": 0})
         try:
-            send_password_reset_otp(recipient=payload.email, otp=otp, smtp_email=smtp_email, smtp_app_password=smtp_password)
+            send_password_reset_otp(recipient=payload.email, otp=otp, sender_email=sender_email,
+                                    sender_name=sender_name, api_key=email_api_key)
         except Exception as exc:
             with store.connection() as db:
                 db.farmer_password_resets.update_one({"id": reset_id}, {"$set": {"consumed_at": now_iso()}})

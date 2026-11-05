@@ -1,4 +1,4 @@
-﻿# CropSense
+# CropSense
 
 React and TypeScript frontend with a Python/scikit-learn crop recommendation API. Crop examples are loaded from CSV files; crop labels, requirements, and recommendation mappings are not embedded in frontend code.
 
@@ -77,8 +77,10 @@ Configure these environment variables before starting the API:
 | `MONGODB_URI` | unset | Required MongoDB Atlas connection URI. Store it as a backend secret; never use a frontend variable. |
 | `MONGODB_DATABASE` | `cropsense` | MongoDB database name. |
 | `GOOGLE_MAPS_API_KEY` | unset | Server-side Google Geocoding API key used to resolve typed farmer locations. Keep it in the API deployment secret store; never put it in frontend variables. |
-| `SMTP_EMAIL` | unset | Gmail SMTP account used by the API to send recommendation PDFs. Set to `cropsensevit@gmail.com`. |
-| `SMTP_APP_PASSWORD` | unset | Google App Password for `SMTP_EMAIL`; backend only. Never use a normal Gmail password or add this value to a `VITE_` variable. |
+| `BREVO_API_KEY` | unset | Brevo transactional email API key. Backend only; never add to a frontend/Vite variable. |
+| `BREVO_SENDER_EMAIL` | unset | Sender address registered and verified in Brevo. |
+| `BREVO_SENDER_NAME` | `CropSense` | Display name used for report and password-reset emails. |
+
 | `OPENROUTER_API_KEY` | unset | OpenRouter API key used by the FastAPI chatbot endpoint. Backend only; never add to frontend/Vite variables. |
 | `OPENROUTER_MODEL` | `qwen/qwen3-30b-a3b:free` | Primary multilingual OpenRouter chatbot model; this mixture-of-experts model activates about 3.3B parameters per token. |
 | `OPENROUTER_FALLBACK_MODELS` | `xingchen-agi/xing4.0-29b-a4b:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | Free model fallbacks from other providers. OpenRouter's free-model daily request limit is account-wide, so switching models does not reset or increase it. |
@@ -114,9 +116,9 @@ npm.cmd run dev
 
 ### Emailing recommendation PDFs
 
-The results page's **Email PDF to me** action sends the generated report to the signed-in farmer's registered account email. The FastAPI server uses Gmail SMTP with STARTTLS; the browser never receives SMTP credentials or chooses the destination address. CropSense does not submit applications or other forms by email. Print remains available independently.
+The results page's **Email PDF to me** action sends the generated report to the signed-in farmer's registered account email. The FastAPI server uses Brevo's HTTPS transactional email API; the browser never receives the provider key or chooses the destination address. CropSense does not submit applications or other forms by email. Print remains available independently.
 
-For local development, copy `.env.example` to `.env` (or set the variables in the API process environment). In the Google account `cropsensevit@gmail.com`, enable 2-Step Verification and create an App Password for this application. Set `SMTP_EMAIL=cropsensevit@gmail.com` and `SMTP_APP_PASSWORD` to that App Password in `.env` or your deployment's secret manager, then restart the API. Do not commit `.env`; do not put SMTP credentials in frontend/Vite configuration. The same Gmail SMTP configuration sends one-time password reset codes for farmer accounts; the administrator sign-in does not offer password reset. Reset codes expire after 10 minutes and are single-use. Automated tests replace SMTP with a mock and never send real mail.
+For local development, copy `.env.example` to `.env` (or set the variables in the API process environment). Create a Brevo account, register and verify a sender address, then add `BREVO_API_KEY` and `BREVO_SENDER_EMAIL` to `.env` or your deployment's secret manager. Do not commit `.env` or expose the API key in frontend/Vite configuration. The same HTTPS email provider sends one-time password-reset codes for farmer accounts; the administrator sign-in does not offer password reset. Reset codes expire after 10 minutes and are single-use.
 
 ### CropSaathi AI
 

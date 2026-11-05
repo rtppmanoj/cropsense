@@ -1,4 +1,4 @@
-"""Authenticated delivery of recommendation PDFs through Gmail SMTP."""
+"""Authenticated report delivery through Brevo's HTTPS transactional email API."""
 from __future__ import annotations
 
 import base64
@@ -7,10 +7,6 @@ from html import escape
 import logging
 import os
 import re
-import smtplib
-import socket
-import ssl
-from email.message import EmailMessage
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -20,7 +16,6 @@ from backend.auth import FarmerUser, _check_origin, _rate_limit
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
 MAX_PDF_BYTES = 8 * 1024 * 1024
-SENDER_ADDRESS = "cropsensevit@gmail.com"
 
 
 class EmailReportRequest(BaseModel):
@@ -49,72 +44,87 @@ def decode_pdf(value: str) -> bytes:
     return content
 
 
-def send_password_reset_otp(*, recipient: str, otp: str, smtp_email: str, smtp_app_password: str) -> None:
-    message = EmailMessage()
-    message["Subject"] = "Your CropSense password reset code"
-    message["From"] = smtp_email
-    message["To"] = recipient
-    message.set_content(
-        f"Your CropSense password reset code is {otp}.\n\n"
-        "It expires in 10 minutes and can be used once. If you did not request this, ignore this email.\n"
+def send_brevo_email(*, recipient: str, subject: str, text_content: str,
+                     sender_email: str, api_key: str, sender_name: str = "CropSense",
+                     html_content: str | None = None,
+                     attachment_name: str | None = None,
+                     attachment_bytes: bytes | None = None) -> None:
+    """Send transactional mail through Brevo's HTTPS API (works on Render Free)."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    body: dict = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": recipient}],
+        "subject": subject,
+        "textContent": text_content,
+    }
+    if html_content:
+        body["htmlContent"] = html_content
+    if attachment_name and attachment_bytes is not None:
+        body["attachment"] = [{"name": attachment_name,
+                               "content": base64.b64encode(attachment_bytes).decode("ascii")}]
+    request = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"api-key": api_key, "accept": "application/json",
+                 "content-type": "application/json"},
+        method="POST",
     )
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as smtp:
-        smtp.ehlo()
-        smtp.starttls(context=ssl.create_default_context())
-        smtp.ehlo()
-        smtp.login(smtp_email, smtp_app_password)
-        smtp.send_message(message)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status not in {200, 201, 202}:
+                raise RuntimeError(f"Brevo returned unexpected status {response.status}")
+    except urllib.error.HTTPError as exc:
+        # Do not log response bodies; provider responses can contain recipient data.
+        raise BrevoDeliveryError(f"Brevo rejected the message (HTTP {exc.code}).", exc.code) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise BrevoDeliveryError("Could not reach Brevo over HTTPS.") from exc
+
+
+class BrevoDeliveryError(Exception):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def send_password_reset_otp(*, recipient: str, otp: str, sender_email: str,
+                            api_key: str, sender_name: str = "CropSense") -> None:
+    send_brevo_email(
+        recipient=recipient,
+        subject="Your CropSense password reset code",
+        text_content=(f"Your CropSense password reset code is {otp}.\n\n"
+                      "It expires in 10 minutes and can be used once. "
+                      "If you did not request this, ignore this email."),
+        sender_email=sender_email, sender_name=sender_name, api_key=api_key,
+    )
 
 
 def send_pdf(*, recipient: str, recipient_name: str, filename: str, pdf_bytes: bytes,
-             smtp_email: str, smtp_app_password: str) -> None:
-    """Build and send one report. SMTP is only called by the API and mocked in tests."""
-    message = EmailMessage()
-    message["Subject"] = "Your CropSense recommendation report"
-    message["From"] = smtp_email
-    message["To"] = recipient
+             sender_email: str, api_key: str, sender_name: str = "CropSense") -> None:
     farmer_name = recipient_name.strip() or "Farmer"
-    message.set_content(
-        f"Dear {farmer_name},\n\n"
-        "Greetings from CropSense!\n\n"
-        "Please find attached your personalized Crop Recommendation and Weather Report, prepared using the land and soil details you provided.\n\n"
-        "Your report includes:\n\n"
-        "- Crop Recommendations: Suitable crop options based on your soil and environmental parameters.\n"
-        "- Weather Outlook: Weather insights for your selected location to support farm planning.\n"
-        "- Smart Farming Insights: Data-driven information to help you make informed and sustainable farming decisions.\n\n"
-        "We hope CropSense helps you plan your farming activities with greater confidence.\n\n"
-        "Thank you for choosing CropSense — Smarter Farming. Better Harvests.\n\n"
-        "Best regards,\nTeam CropSense\nCropSense — A Smart Farm Labs Initiative\n"
-        "AI-powered insights for smarter, more sustainable agriculture.\n"
+    text_content = (
+        f"Dear {farmer_name},\n\nGreetings from CropSense!\n\n"
+        "Please find attached your personalized Crop Recommendation and Weather Report, "
+        "prepared using the land and soil details you provided.\n\n"
+        "Your report includes crop recommendations, weather outlook, and smart farming insights.\n\n"
+        "CropSense ? A Smart Farm Labs Initiative"
     )
     safe_name = escape(farmer_name)
-    message.add_alternative(
-        f"""<!doctype html><html><body style="font-family:Arial,sans-serif;color:#203c2c;line-height:1.6">
-        <p>Dear {safe_name},</p>
-        <p>Greetings from <strong>CropSense!</strong></p>
-        <p>Please find attached your personalized <strong>Crop Recommendation and Weather Report</strong>, prepared using the land and soil details you provided.</p>
-        <p>Your report includes:</p>
-        <ul>
-          <li><strong>Crop Recommendations:</strong> Suitable crop options based on your soil and environmental parameters.</li>
-          <li><strong>Weather Outlook:</strong> Weather insights for your selected location to support farm planning.</li>
-          <li><strong>Smart Farming Insights:</strong> Data-driven information to help you make informed and sustainable farming decisions.</li>
-        </ul>
-        <p>We hope CropSense helps you plan your farming activities with greater confidence.</p>
-        <p>Thank you for choosing <strong>CropSense — Smarter Farming. Better Harvests.</strong></p>
-        <p>Best regards,<br><strong>Team CropSense</strong><br>
-        <em>CropSense — A Smart Farm Labs Initiative</em><br>
-        <em>AI-powered insights for smarter, more sustainable agriculture.</em></p>
-        </body></html>""",
-        subtype="html",
+    html_content = f"""<!doctype html><html><body style="font-family:Arial,sans-serif;color:#203c2c;line-height:1.6">
+    <p>Dear {safe_name},</p><p>Greetings from <strong>CropSense!</strong></p>
+    <p>Please find attached your personalized <strong>Crop Recommendation and Weather Report</strong>.</p>
+    <p>Your report includes suitable crop recommendations, weather outlook, and smart farming insights.</p>
+    <p>Thank you for choosing CropSense ? Smarter Farming. Better Harvests.</p>
+    <p>Best regards,<br><strong>Team CropSense</strong><br><em>CropSense ? A Smart Farm Labs Initiative</em></p>
+    </body></html>"""
+    send_brevo_email(
+        recipient=recipient, subject="Your CropSense recommendation report",
+        text_content=text_content, html_content=html_content, sender_email=sender_email,
+        sender_name=sender_name, api_key=api_key, attachment_name=filename,
+        attachment_bytes=pdf_bytes,
     )
-    message.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
-
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as smtp:
-        smtp.ehlo()
-        smtp.starttls(context=ssl.create_default_context())
-        smtp.ehlo()
-        smtp.login(smtp_email, smtp_app_password)
-        smtp.send_message(message)
 
 
 @router.post("/email-report")
@@ -124,22 +134,20 @@ def email_report(payload: EmailReportRequest, request: Request, user: FarmerUser
     # Always take the destination from the authenticated database user.
     recipient = str(user["email"])
     pdf_bytes = decode_pdf(payload.pdf_base64)
-    smtp_email = os.getenv("SMTP_EMAIL", "").strip()
-    # Google presents App Passwords in groups with spaces; normalize that copy format.
-    smtp_app_password = "".join(os.getenv("SMTP_APP_PASSWORD", "").split())
-    if not smtp_email or not smtp_app_password:
-        raise HTTPException(status_code=503, detail="Email delivery is not configured. Set SMTP_EMAIL and SMTP_APP_PASSWORD on the API server.")
-    if smtp_email.lower() != SENDER_ADDRESS:
-        raise HTTPException(status_code=503, detail=f"SMTP_EMAIL must be set to {SENDER_ADDRESS}.")
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    sender_name = os.getenv("BREVO_SENDER_NAME", "CropSense").strip() or "CropSense"
+    if not api_key or not sender_email:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL on the API server.")
 
     try:
         send_pdf(recipient=recipient, recipient_name=str(user.get("display_name", "")),
-                 filename=payload.filename, pdf_bytes=pdf_bytes, smtp_email=smtp_email,
-                 smtp_app_password=smtp_app_password)
-    except (smtplib.SMTPException, socket.timeout, TimeoutError, OSError) as exc:
-        # Avoid logging exception text, which may contain server-provided data.
-        logger.error("SMTP report delivery failed user_id=%s error_type=%s", user["id"], type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Gmail could not send the report right now. Please try again shortly.") from exc
+                 filename=payload.filename, pdf_bytes=pdf_bytes, sender_email=sender_email,
+                 sender_name=sender_name, api_key=api_key)
+    except BrevoDeliveryError as exc:
+        logger.error("Transactional report delivery failed user_id=%s error_type=%s provider_status=%s",
+                     user["id"], type(exc).__name__, exc.status_code or "network")
+        raise HTTPException(status_code=502, detail="The email provider could not send the report. Check the Brevo sender verification and API key, then try again.") from exc
 
-    logger.info("SMTP report delivered user_id=%s", user["id"])
+    logger.info("Transactional report delivered user_id=%s", user["id"])
     return {"status": "sent"}
