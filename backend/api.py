@@ -26,6 +26,7 @@ from backend.auth import router as auth_router, store as auth_store
 from backend.auth_admin import ensure_admin_from_environment
 from backend.auth_store import DB_ERRORS
 from backend.email_report import router as email_report_router
+from backend.whatsapp_report import router as whatsapp_report_router
 from backend.chatbot import router as chatbot_router
 from backend.plans import router as plans_router
 
@@ -66,6 +67,7 @@ if os.getenv("CROPSENSE_ENV", "development").lower() != "production":
 app.add_middleware(CORSMiddleware, **cors_settings)
 app.include_router(auth_router)
 app.include_router(email_report_router)
+app.include_router(whatsapp_report_router)
 app.include_router(chatbot_router)
 app.include_router(plans_router)
 

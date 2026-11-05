@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { AlertCircle, ArrowLeft, Download, Loader2, Mail, Printer, Sprout } from 'lucide-react';
+import { AlertCircle, ArrowLeft, Download, Loader2, Mail, MessageCircle, Printer, Sprout } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import CropCard from '../components/CropCard';
 import WeatherClimateSection, { type WeatherReportData, type WeatherReportStatus } from '../components/WeatherClimateSection';
@@ -29,6 +29,7 @@ export default function RecommendationResult() {
   const [progress, setProgress] = useState(0);
   const [downloadMessage, setDownloadMessage] = useState('');
   const [emailing, setEmailing] = useState(false);
+  const [whatsappSending, setWhatsappSending] = useState(false);
   const [generatingPdf, setGeneratingPdf] = useState(false);
   const [preparedPdf, setPreparedPdf] = useState<{ blob: Blob; base64: string; filename: string } | null>(null);
   const [weatherReport, setWeatherReport] = useState<{ data: WeatherReportData | null; status: WeatherReportStatus }>({ data: null, status: 'notRequested' });
@@ -322,6 +323,23 @@ export default function RecommendationResult() {
       setEmailing(false);
     }
   };
+  const deliverPdfByWhatsApp = async () => {
+    if (!preparedPdf || !user?.mobile_number) return;
+    setWhatsappSending(true);
+    setDownloadMessage('');
+    try {
+      await apiFetch<{ status: string }>('/whatsapp-report', {
+        timeoutMs: 90_000, method: 'POST',
+        body: JSON.stringify({ pdf_base64: preparedPdf.base64, filename: preparedPdf.filename, report_id: result?.report_id }),
+      });
+      setDownloadMessage(t('results.whatsappAccepted'));
+      window.setTimeout(() => setDownloadMessage(''), 6000);
+    } catch (reason) {
+      setDownloadMessage(reason instanceof Error ? reason.message : t('results.pdfError'));
+    } finally {
+      setWhatsappSending(false);
+    }
+  };
   const inputLabel = (key: keyof CropFormData) => t(`form.fields.${key}`);
   const units: Record<keyof CropFormData, string> = { nitrogen: t('form.units.kgPerHa'), phosphorus: t('form.units.kgPerHa'), potassium: t('form.units.kgPerHa'), ph: t('form.units.ph'), soil_moisture: t('form.units.percent'), temperature: t('form.units.celsius'), humidity: t('form.units.percent') };
   const stage = progress < 30 ? t('results.loadingValidate') : progress < 70 ? t('results.loading') : t('results.loadingPrepare');
@@ -333,6 +351,7 @@ export default function RecommendationResult() {
         {!preparedPdf ? <button type="button" onClick={() => void generatePdf()} disabled={generatingPdf || weatherReport.status === 'notRequested' || weatherReport.status === 'loading'} aria-busy={generatingPdf} className="primary-button disabled:cursor-wait disabled:opacity-60">{generatingPdf ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}{generatingPdf ? t('results.generatingPdf') : t('results.generatePdf')}</button> : <>
           <button type="button" onClick={downloadPdf} className="primary-button"><Download className="h-4 w-4" />{t('results.downloadPdf')}</button>
           <button type="button" onClick={() => void deliverPdfByEmail()} disabled={emailing || !user?.email} aria-busy={emailing} className="secondary-button disabled:cursor-wait disabled:opacity-60">{emailing ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />}{emailing ? t('results.emailSending') : t('results.emailPdf')}</button>
+          <button type="button" onClick={() => void deliverPdfByWhatsApp()} disabled={whatsappSending || !user?.mobile_number} aria-busy={whatsappSending} className="secondary-button disabled:cursor-wait disabled:opacity-60">{whatsappSending ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : <MessageCircle className="h-4 w-4" />}{whatsappSending ? t('results.whatsappSending') : t('results.whatsappPdf')}</button>
           <button type="button" onClick={() => window.print()} className="secondary-button"><Printer className="h-4 w-4" />{t('results.printPage')}</button>
         </>}
       </div>}

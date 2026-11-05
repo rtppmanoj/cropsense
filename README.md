@@ -80,6 +80,12 @@ Configure these environment variables before starting the API:
 | `BREVO_API_KEY` | unset | Brevo transactional email API key. Backend only; never add to a frontend/Vite variable. |
 | `BREVO_SENDER_EMAIL` | unset | Sender address registered and verified in Brevo. |
 | `BREVO_SENDER_NAME` | `CropSense` | Display name used for report and password-reset emails. |
+| `WHATSAPP_ACCESS_TOKEN` | unset | Backend-only Meta WhatsApp Cloud API access token. |
+| `WHATSAPP_PHONE_NUMBER_ID` | unset | Cloud API sender phone number ID (not the WhatsApp Business Account ID). |
+| `WHATSAPP_TEMPLATE_NAME` | unset | Exact approved document-header message template name. |
+| `WHATSAPP_TEMPLATE_LANGUAGE` | unset | Exact language/locale code on the template, such as `en` or `en_US`. |
+| `WHATSAPP_GRAPH_API_VERSION` | `v26.0` | Graph API version used for WhatsApp requests. |
+| `WHATSAPP_TEMPLATE_BODY_FIELDS` | empty | Ordered body placeholders: `farmer_name`, `report_id`, or both separated by commas. Leave empty if there are no body placeholders. |
 
 | `OPENROUTER_API_KEY` | unset | OpenRouter API key used by the FastAPI chatbot endpoint. Backend only; never add to frontend/Vite variables. |
 | `OPENROUTER_MODEL` | `qwen/qwen3-30b-a3b:free` | Primary multilingual OpenRouter chatbot model; this mixture-of-experts model activates about 3.3B parameters per token. |
@@ -116,7 +122,7 @@ npm.cmd run dev
 
 ### Emailing recommendation PDFs
 
-The results page's **Email PDF to me** action sends the generated report to the signed-in farmer's registered account email. The FastAPI server uses Brevo's HTTPS transactional email API; the browser never receives the provider key or chooses the destination address. CropSense does not submit applications or other forms by email. Print remains available independently.
+The results page's **Email PDF to me** action sends the generated report to the signed-in farmer's registered account email. The FastAPI server uses Brevo's HTTPS transactional email API; the browser never receives the provider key or chooses the destination address. Farmers can also send the generated PDF to their saved WhatsApp number through an approved Meta document-header template. CropSense does not submit applications or other forms by email. Print remains available independently.
 
 For local development, copy `.env.example` to `.env` (or set the variables in the API process environment). Create a Brevo account, register and verify a sender address, then add `BREVO_API_KEY` and `BREVO_SENDER_EMAIL` to `.env` or your deployment's secret manager. Do not commit `.env` or expose the API key in frontend/Vite configuration. The same HTTPS email provider sends one-time password-reset codes for farmer accounts; the administrator sign-in does not offer password reset. Reset codes expire after 10 minutes and are single-use.
 
