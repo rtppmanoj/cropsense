@@ -45,11 +45,14 @@ class WhatsAppReportRequest(BaseModel):
 
 class WhatsAppDeliveryError(Exception):
     def __init__(self, message: str, *, status: int | None = None,
-                 code: int | str | None = None, subcode: int | str | None = None):
+                 code: int | str | None = None, subcode: int | str | None = None,
+                 operation: str = "request", provider_message: str = ""):
         super().__init__(message)
         self.status = status
         self.code = code
         self.subcode = subcode
+        self.operation = operation
+        self.provider_message = provider_message
 
 
 def _config() -> tuple[str, str, str, str, str, list[str]]:
@@ -59,10 +62,20 @@ def _config() -> tuple[str, str, str, str, str, list[str]]:
     language = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "").strip()
     version = os.getenv("WHATSAPP_GRAPH_API_VERSION", DEFAULT_GRAPH_VERSION).strip()
     body_fields = [part.strip() for part in os.getenv("WHATSAPP_TEMPLATE_BODY_FIELDS", "").split(",") if part.strip()]
-    if not all((token, phone_number_id, template_name, language)):
+    missing = [
+        name for name, value in (
+            ("WHATSAPP_ACCESS_TOKEN", token),
+            ("WHATSAPP_PHONE_NUMBER_ID", phone_number_id),
+            ("WHATSAPP_TEMPLATE_NAME", template_name),
+            ("WHATSAPP_TEMPLATE_LANGUAGE", language),
+        )
+        if not value
+    ]
+    if missing:
         raise HTTPException(status_code=503, detail=(
-            "WhatsApp report delivery is not configured. Set the WhatsApp Cloud API token, "
-            "phone number ID, template name, and exact template language in the API environment."
+            "WhatsApp report delivery is not configured. Missing or empty API environment variable(s): "
+            + ", ".join(missing)
+            + ". Add them to the Render backend service environment and redeploy."
         ))
     if not re.fullmatch(r"v[0-9]+\.[0-9]+", version):
         raise HTTPException(status_code=503, detail="WHATSAPP_GRAPH_API_VERSION must look like v26.0.")
@@ -86,6 +99,7 @@ def _recipient_number(value: str | None) -> str:
 
 
 def _api_call(url: str, token: str, data: bytes, content_type: str) -> dict:
+    operation = "media upload" if url.endswith("/media") else "template send"
     request = urllib.request.Request(
         url, data=data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": content_type, "Accept": "application/json"},
@@ -100,15 +114,20 @@ def _api_call(url: str, token: str, data: bytes, content_type: str) -> dict:
             return result
     except urllib.error.HTTPError as exc:
         try:
-            provider_error = json.loads(exc.read().decode("utf-8")).get("error", {})
+            error_payload = json.loads(exc.read().decode("utf-8")).get("error", {})
         except (ValueError, AttributeError):
-            provider_error = {}
+            error_payload = {}
+        provider_message = str(error_payload.get("message") or "")[:300]
+        error_data = error_payload.get("error_data")
+        if isinstance(error_data, dict) and error_data.get("details"):
+            provider_message = f"{provider_message} — {str(error_data['details'])[:300]}".strip(" —")
         raise WhatsAppDeliveryError(
             "Meta rejected the WhatsApp report request.", status=exc.code,
-            code=provider_error.get("code"), subcode=provider_error.get("error_subcode"),
+            code=error_payload.get("code"), subcode=error_payload.get("error_subcode"),
+            operation=operation, provider_message=provider_message,
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise WhatsAppDeliveryError("Could not connect to the WhatsApp Cloud API.") from exc
+        raise WhatsAppDeliveryError("Could not connect to the WhatsApp Cloud API.", operation=operation) from exc
 
 
 def _upload_pdf(token: str, phone_number_id: str, version: str, filename: str, pdf_bytes: bytes) -> str:
@@ -182,12 +201,13 @@ def whatsapp_report(payload: WhatsAppReportRequest, request: Request, user: Farm
                                 media_id, payload.filename, body_fields,
                                 str(user.get("display_name", "")), payload.report_id)
     except WhatsAppDeliveryError as exc:
-        logger.error("WhatsApp report delivery rejected user_id=%s status=%s code=%s subcode=%s",
-                     user["id"], exc.status or "network", exc.code or "unknown", exc.subcode or "unknown")
+        logger.error("WhatsApp report delivery rejected user_id=%s step=%s status=%s code=%s subcode=%s detail=%s",
+                     user["id"], exc.operation, exc.status or "network", exc.code or "unknown",
+                     exc.subcode or "unknown", exc.provider_message or "unavailable")
         code = f" (Meta code {exc.code})" if exc.code else ""
+        provider_detail = f" Meta says: {exc.provider_message}" if exc.provider_message else ""
         raise HTTPException(status_code=502, detail=(
-            f"WhatsApp could not send the report{code}. Check the approved template name, exact language, "
-            "document header, and Cloud API credentials."
+            f"WhatsApp could not send the report during {exc.operation}{code}.{provider_detail}"
         )) from exc
 
     message_ids = [item.get("id") for item in result.get("messages", []) if item.get("id")]
